@@ -173,6 +173,11 @@ public:
   tree_walker_nodes_t m_new_nodes;
   double m_tree_offset[3];
   std::vector<tree_id_t> m_trees_to_load;
+  // How many entries m_trees_to_load ended the walk with. Kept separately because the caller MOVES the
+  // vector out (processor_t::walk_tree hands it to request_trees_async, which takes it by value), so
+  // reading .size() after the walk reports 0 no matter how many trees the walk was waiting for -- which
+  // is what the walker_trees_to_load frame timing, and the public getter over it, used to report.
+  size_t m_trees_requested = 0;
   node_set_t m_previously_subdivided;
   bool m_debug = false;
 };

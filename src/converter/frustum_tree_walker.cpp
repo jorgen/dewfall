@@ -266,6 +266,10 @@ void walk_tree_direct(const tree_registry_t &tree_registry, attribute_index_map_
 {
   auto root = tree_registry.root;
   walk_tree(tree_registry, attribute_index_map, root, walker);
+  // Capture the count here, while the vector is still ours: the caller moves it into
+  // request_trees_async. An unresident tree is pushed again on every frame it is missing, so this is a
+  // live "the walk is waiting on N sub-trees" signal, not a one-shot request count.
+  walker.m_trees_requested = walker.m_trees_to_load.size();
 }
 
 } // namespace dew::converter

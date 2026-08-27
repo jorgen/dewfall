@@ -271,7 +271,7 @@ void dew_converter_data_source_t::add_to_frame(dew_frame_camera_t *c_camera, dew
   auto &walker_subsets = walker.m_new_nodes.point_subsets;
   std::sort(walker_subsets.begin(), walker_subsets.end(), render_node_less_than);
   frame_timings.walker_node_count = int(walker_subsets.size());
-  frame_timings.walker_trees_to_load = int(walker.m_trees_to_load.size());
+  frame_timings.walker_trees_to_load = int(walker.m_trees_requested); // NOT .size(): walk_tree moved the vector away
   {
     uint64_t total_pts = 0;
     for (auto &s : walker_subsets)
