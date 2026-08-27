@@ -15,12 +15,18 @@ on:
 
 concurrency:
   group: wheels-${{ github.ref }}
-  cancel-in-progress: true
+  # Right for a PR push, wrong for a release: four v0.1.0 attempts were force-pushed to the same tag
+  # ref and each cancelled the run still in flight, so none of them ever produced an artifact.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   wheels:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # pyproject's faulthandler_timeout DUMPS a hung test's stacks but does not kill it, so without a
+    # job bound a wedged test runs to the 6-hour default. Two arm64 jobs had to be cancelled by hand
+    # at ~2.5h. A green run is about 20 minutes.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +144,7 @@ jobs:
     name: ${{ matrix.os }} py${{ matrix.python }}
     needs: wheels
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
