@@ -39,9 +39,13 @@
 #include <dew/converter/converter.h>
 #include <dew/core/default_attribute_names.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace
@@ -168,4 +172,123 @@ TEST_CASE("dropping a converter mid-conversion does not abort" * doctest::timeou
   for (int i = 0; i < 8; i++)
     run_cycle("converter_teardown_midconvert.dew", good_pre_init, false);
   CHECK(true);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A file dispatched to the reader BEFORE its own pre_init has answered.
+
+namespace
+{
+
+constexpr char k_slow_failing_name[] = "slow_failing";
+
+// Per-file emitted counter, so the two inputs below cannot race on a global one.
+void init_counted(const char *name, size_t name_len, dew_converter_header_t *header, dew_attributes_t *attributes, void **user_ptr, dew_error_t **error)
+{
+  init(name, name_len, header, attributes, user_ptr, error);
+  if (user_ptr)
+    *user_ptr = new uint32_t(0);
+}
+
+void convert_data_counted(void *user_ptr, const dew_converter_header_t *, const dew_attribute_t *, uint32_t, uint32_t max_points,
+                          dew_blob_t *buffers, uint32_t buffer_count, uint32_t *points_read, uint8_t *done, dew_error_t **)
+{
+  auto *emitted = static_cast<uint32_t *>(user_ptr);
+  const uint32_t so_far = emitted ? *emitted : 0;
+  const uint32_t remaining = k_points - so_far;
+  const uint32_t n = remaining < max_points ? remaining : max_points;
+  if (buffer_count >= 1 && buffers[0].data)
+  {
+    auto *xyz = static_cast<int32_t *>(buffers[0].data);
+    for (uint32_t i = 0; i < n; i++)
+    {
+      const uint32_t p = so_far + i;
+      xyz[i * 3 + 0] = int32_t(p % 317);
+      xyz[i * 3 + 1] = int32_t((p / 317) % 317);
+      xyz[i * 3 + 2] = int32_t(p % 91);
+    }
+  }
+  if (emitted)
+    *emitted += n;
+  *points_read = n;
+  *done = (so_far + n) >= k_points ? 1 : 0;
+}
+
+void destroy_user_ptr(void *user_ptr)
+{
+  delete static_cast<uint32_t *>(user_ptr);
+}
+
+// Slow AND failing for one name, immediate success for every other. The delay is what lets the
+// file be handed to the reader while its own pre-init is still running.
+dew_converter_file_pre_init_info_t slow_failing_pre_init(const char *name, size_t name_len, dew_error_t **error)
+{
+  if (std::string_view(name, name_len) == k_slow_failing_name)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return failing_pre_init(name, name_len, error);
+  }
+  return good_pre_init(name, name_len, error);
+}
+
+} // namespace
+
+TEST_CASE("a file dispatched before its failing pre_init answers still reaches idle" * doctest::timeout(180))
+{
+  // THE SHAPE. next_input_to_process only rebuilds its heap when _unsorted_input_sources_dirty is
+  // set, and register_file does not set it -- only a pre-init RESULT does. So one file whose
+  // pre_init fails is never dispatched at all, which is why the single-file case above passes.
+  // Add a SECOND file whose pre_init succeeds quickly and the picture changes: its result dirties
+  // the heap, the rebuild sees the first file (registered, pre-init still in flight, so
+  // read_started is false) and hands it to the reader. The reader finishes it and retires it; the
+  // failing pre_init then retires it AGAIN. _input_data_id_done_count overshoots _registry.size(),
+  // all_inserted_into_tree() is false for the rest of the run, and wait_idle() never returns.
+  //
+  // This is the C form of the Python suite's test_python_producer_error_propagates, which hung the
+  // macOS arm64 wheel job for the full 5 minute faulthandler timeout.
+  const char *path = "converter_preinit_dispatch_race.dew";
+  std::remove(path);
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_truncate, &error);
+  REQUIRE(converter != nullptr);
+
+  dew_converter_file_convert_callbacks_t callbacks{};
+  callbacks.pre_init = slow_failing_pre_init;
+  callbacks.init = init_counted;
+  callbacks.convert_data = convert_data_counted;
+  callbacks.destroy_user_ptr = destroy_user_ptr;
+  dew_converter_set_file_converter_callbacks(converter, callbacks);
+  dew_converter_set_node_point_limit(converter, 900);
+
+  std::atomic<bool> reached_idle{false};
+  std::thread worker([&] {
+    dew_converter_str_buffer slow{k_slow_failing_name, uint32_t(strlen(k_slow_failing_name))};
+    dew_converter_add_data_file(converter, &slow, 1);
+    // Land the second file while the first one's pre_init is still sleeping.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    dew_converter_str_buffer fast{"synthetic", 9};
+    dew_converter_add_data_file(converter, &fast, 1);
+    dew_converter_wait_idle(converter);
+    reached_idle.store(true, std::memory_order_release);
+  });
+
+  // Bounded, because the regression is a PERMANENT wedge: waiting on it with join() would hang the
+  // whole test binary with nothing reported, which is precisely the failure mode that cost two
+  // 2.5-hour CI jobs. Detach and report instead -- a leak on the failure path is the cheap half.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (!reached_idle.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  const bool idle = reached_idle.load(std::memory_order_acquire);
+  if (idle)
+  {
+    worker.join();
+    dew_converter_destroy(converter);
+    std::remove(path);
+  }
+  else
+  {
+    worker.detach();
+  }
+  REQUIRE(idle);
 }

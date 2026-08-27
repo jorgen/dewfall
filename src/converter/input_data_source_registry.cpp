@@ -102,6 +102,7 @@ void input_data_source_registry_t::register_pre_init_result(const tree_config_t 
     convert_pos_to_morton(tree_config.scale, tree_config.offset, min, item.input_order);
   else
     memset(&item.input_order, 0, sizeof(item.input_order));
+  item.pre_init_settled = true;
   _unsorted_input_sources_dirty = true;
 }
 
@@ -143,10 +144,17 @@ void input_data_source_registry_t::handle_points_written(input_data_id_t id, std
   item.storage_locations = std::move(location);
 }
 
+// An input is retired EXACTLY once. Both retire paths can fire for the same input -- a file whose
+// pre-init fails after it was already dispatched gets one from the reader and one from the failure
+// -- and a double count leaves _input_data_id_done_count above _registry.size(), which makes
+// all_inserted_into_tree() false for the rest of the run: the processor never goes idle and
+// wait_idle() blocks forever.
 void input_data_source_registry_t::handle_reading_done(input_data_id_t id)
 {
   std::unique_lock<std::mutex> lock(_mutex);
   auto &item = get_item(id, _registry);
+  if (item.read_finished)
+    return;
   item.read_finished = true;
   _input_data_id_done_count++;
 }
@@ -155,7 +163,12 @@ void input_data_source_registry_t::handle_file_failed(input_data_id_t id)
 {
   std::unique_lock<std::mutex> lock(_mutex);
   auto &item = get_item(id, _registry);
+  // A failed pre-init settles the file: never dispatch it, and drop it from a heap already built.
+  item.pre_init_settled = true;
   item.read_started = true;
+  _unsorted_input_sources_dirty = true;
+  if (item.read_finished)
+    return;
   item.read_finished = true;
   _input_data_id_done_count++;
 }
@@ -189,7 +202,9 @@ std::optional<input_data_next_input_t> input_data_source_registry_t::next_input_
     _unsorted_input_sources = {};
     for (auto &item : _registry)
     {
-      if (!item.second.read_started)
+      // Only files whose pre-init has answered. Dispatching one while its pre_init is still in
+      // flight races the failure path against the reader's completion, and both retire it.
+      if (!item.second.read_started && item.second.pre_init_settled)
       {
         _unsorted_input_sources.push_back(item.first);
       }
@@ -398,6 +413,10 @@ dew_error_t input_data_source_registry_t::deserialize(const uint8_t *data, uint3
       return invalid;
     item.read_started = read_started != 0;
     item.read_finished = read_finished != 0;
+    // The snapshot has no pre-init section, so restored inputs keep today's dispatch semantics:
+    // eligible immediately. Re-adding the file by name runs pre_init again anyway, which is what
+    // refreshes the approximate sizes.
+    item.pre_init_settled = true;
     _input_data_with_sub_parts += item.sub_count;
     _input_data_inserted_to_tree += item.inserted_into_tree;
     if (item.read_finished)

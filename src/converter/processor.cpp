@@ -467,6 +467,8 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
       }
     }
   }
+  std::vector<input_data_id_t> settled;
+  settled.reserve(results.size());
   for (auto &result : results)
   {
     if (!result.has_value())
@@ -475,6 +477,7 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
     if (r.has_error)
     {
       _input_data_source_registry.handle_file_failed(r.input_id);
+      settled.push_back(r.input_id);
       _has_errors = true;
       if (_runtime_callbacks.error)
         _runtime_callbacks.error(_runtime_callback_user_ptr, &r.file_error.error);
@@ -484,7 +487,21 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
       _input_data_source_registry.register_pre_init_result(_tree_handler.tree_config(), r.pre_init_result.id, r.pre_init_result.found_min, r.pre_init_result.min,
                                                            r.pre_init_result.approximate_point_count, r.pre_init_result.approximate_point_size_bytes, r.pre_init_result.input_file_size_bytes);
       _storage_handler.register_input_file_size(r.pre_init_result.id.data, r.pre_init_result.input_file_size_bytes);
+      settled.push_back(r.pre_init_result.id);
     }
+  }
+  // Every input registered in this batch has to SETTLE, one way or the other: an unsettled one is
+  // neither dispatchable (next_input_to_process skips it) nor retired, so all_inserted_into_tree()
+  // never turns true and wait_idle() blocks for good. schedule_work may answer with an unexpected,
+  // which carries no input id, so sweep for whatever the results did not account for rather than
+  // assuming they line up with the requests.
+  for (const auto &file_ref : file_refs)
+  {
+    bool found = false;
+    for (const auto &id : settled)
+      found = found || id == file_ref.first;
+    if (!found)
+      _input_data_source_registry.handle_file_failed(file_ref.first);
   }
 }
 

@@ -47,6 +47,11 @@ struct input_data_source_impl_t
   morton::morton192_t input_order;
   bool read_started = false;
   bool read_finished = false;
+  // A pre-init result -- success OR failure -- has landed. Until it has, the file must NOT be
+  // dispatched: handle_file_failed() would then retire an input the reader is already reading, and
+  // both retire paths bump _input_data_id_done_count. The count overshoots _registry.size(), so
+  // all_inserted_into_tree() is false forever and the processor never goes idle.
+  bool pre_init_settled = false;
   uint8_t approximate_point_size_bytes = 0;
   uint32_t inserted_into_tree = 0;
   uint32_t sub_count = 0;

@@ -15,6 +15,13 @@ test_cache_file
 access_snapshot_cache_file
 access_query_test.dew
 blob_reader_test_cache_file
+converter_teardown_*.dew
+converter_preinit_dispatch_race.dew
+cpp_await_test.dew
+dewpp_test.dew
+render_callback_test.dew
+render_callback_unbalanced.dew
+tree_set_test_cache_file
 screenshot_*.png
 screenshot_*.jpeg
 .venv/
