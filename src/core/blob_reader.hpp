@@ -175,12 +175,19 @@ public:
   void stop_loop();
 
   // Await this before file_exists() on any path that must not block; see storage_backend_t.
-  vio::task_t<dew_error_t> probe_exists_async() { co_return _backend ? co_await _backend->probe_exists_async() : dew_error_t{1, "no storage backend"}; }
+  //
+  // BOTH async entry points take the CALLER's loop, and they have to. The backend coroutines drive
+  // vio::read_file / the objstore io against THIS reader's loop, while vio's task_t starts eagerly on
+  // the calling thread -- so simply awaiting them from another loop's thread submits uv work to a
+  // foreign loop and then races that loop for the completion (a data race on vio's awaiter state, and
+  // a lost wakeup that hangs the caller in dew_dataset_wait_ready). co_on_loop starts them on
+  // _event_loop and resumes you on resume_loop; see loop_hop.hpp.
+  vio::task_t<dew_error_t> probe_exists_async(vio::event_loop_t &resume_loop);
   [[nodiscard]] bool file_exists() const { return _backend && _backend->exists(); }
   [[nodiscard]] std::string file_exists_error() const { return _backend ? _backend->exists_error() : std::string(); }
   [[nodiscard]] dew_error_t read_index(index_load_t &out);
-  // Non-blocking index read; resumes on whichever loop the awaiting coroutine runs on.
-  vio::task_t<dew_error_t> read_index_async(index_load_t &out);
+  // Non-blocking index read; runs on this reader's loop, resumes the caller on resume_loop.
+  vio::task_t<dew_error_t> read_index_async(index_load_t &out, vio::event_loop_t &resume_loop);
 
   std::shared_ptr<read_request_t> read(storage_location_t location, read_options_t options = {});
 
@@ -215,7 +222,10 @@ private:
   vio::thread_with_event_loop_t _event_loop_thread;
   vio::event_loop_t &_event_loop;
   std::unique_ptr<storage_backend_t> _backend;
-  std::atomic<int> _reads_in_flight{0}; // do_read_request coroutines currently holding the backend/a connection
+  // Backend coroutines currently holding the backend (and, on an object store, a pooled connection)
+  // across a co_await: do_read_request, plus the bootstrap index-read/probe hops. stop_loop() waits
+  // this out before destroying the backend under one of them.
+  std::atomic<int> _reads_in_flight{0};
   std::atomic<int> _peak_reads_in_flight{0};
   perf_stats_t &_perf_stats;
   vio::event_pipe_t<dew_error_t> &_storage_error;

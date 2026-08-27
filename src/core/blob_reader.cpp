@@ -18,6 +18,7 @@
 #include "blob_reader.hpp"
 
 #include "compressor.hpp"
+#include "loop_hop.hpp"
 
 #include <vio/operation/work.h>
 
@@ -133,9 +134,11 @@ void blob_reader_t::stop_loop()
 #endif
     };
     // (1) Dispatch any queued read requests into in-flight coroutines, then wait for every in-flight read to
-    //     finish -- each holds the backend and a pooled connection across its network co_await. No new reads
-    //     are posted during teardown (the render loader is gone, tree loads are quiesced), so this converges;
-    //     the loop advances the reads on its own thread.
+    //     finish -- each holds the backend and a pooled connection across its network co_await. Bootstrap
+    //     index-read/probe hops count too (loop_hop.hpp): they were posted to this loop BEFORE the barrier
+    //     below, so by the time it returns they have raised the counter. No new reads are posted during
+    //     teardown (the render loader is gone, tree loads are quiesced), so this converges; the loop
+    //     advances the reads on its own thread.
     run_on_loop_sync([]() {});
 #ifdef __EMSCRIPTEN__
     // Same reason as above: yielding hands off to nobody when there is no other thread. Pump instead,
@@ -163,9 +166,25 @@ dew_error_t blob_reader_t::read_index(index_load_t &out)
   return _backend->read_index(out);
 }
 
-vio::task_t<dew_error_t> blob_reader_t::read_index_async(index_load_t &out)
+vio::task_t<dew_error_t> blob_reader_t::probe_exists_async(vio::event_loop_t &resume_loop)
 {
-  co_return co_await _backend->read_index_async(out);
+  if (!_backend)
+    co_return dew_error_t{1, "no storage backend"};
+  // Hopped, not awaited directly: object_backend_t's probe co_awaits an object_info bound to
+  // _event_loop, and running that from the caller's thread is the race loop_hop.hpp exists to stop.
+  auto *backend = _backend.get();
+  co_return co_await co_on_loop(_event_loop, resume_loop, [backend]() { return backend->probe_exists_async(); }, &_reads_in_flight);
+}
+
+vio::task_t<dew_error_t> blob_reader_t::read_index_async(index_load_t &out, vio::event_loop_t &resume_loop)
+{
+  if (!_backend)
+    co_return dew_error_t{1, "no storage backend"};
+  // `out` lives in the AWAITING coroutine's frame, which stays alive across this co_await; the hop
+  // writes it on the storage loop and the mutex/run_in_loop handoff publishes it to the caller.
+  auto *backend = _backend.get();
+  auto *out_ptr = &out;
+  co_return co_await co_on_loop(_event_loop, resume_loop, [backend, out_ptr]() { return backend->read_index_async(*out_ptr); }, &_reads_in_flight);
 }
 
 read_request_t::awaiter_t co_read(blob_reader_t &reader, storage_location_t location, read_options_t options, vio::event_loop_t &resume_loop, std::shared_ptr<read_request_t> &out)

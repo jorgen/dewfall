@@ -19,6 +19,7 @@
 #include "dataset_impl.hpp"
 
 #include "budget.hpp"
+#include "loop_quiesce.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -87,7 +88,7 @@ vio::task_t<void> dataset_impl_t::co_open()
   // Await the existence probe before asking for its answer. file_exists() is a plain getter, but on an
   // object store the answer costs a HEAD, and reaching it through the blocking path would stall the
   // dataset loop -- under wasm, fatally: the loop is cooperative and there is no ASYNCIFY to unwind.
-  error = co_await reader->probe_exists_async();
+  error = co_await reader->probe_exists_async(loop_thread.event_loop());
   if (error.code != 0)
   {
     set_state(dew_dataset_error);
@@ -101,7 +102,7 @@ vio::task_t<void> dataset_impl_t::co_open()
   }
 
   index_load_t load;
-  error = co_await reader->read_index_async(load);
+  error = co_await reader->read_index_async(load, loop_thread.event_loop());
   if (error.code != 0)
   {
     set_state(dew_dataset_error);
@@ -160,6 +161,13 @@ dataset_impl_t::~dataset_impl_t()
   pool.join();
   if (reader)
     reader->stop_loop();
+  // co_open and every tree load resume on THIS loop, and stop_loop only guarantees that those resumes
+  // have been POSTED -- a dataset destroyed while still opening still has one queued here. Drain it
+  // (bounded, loop_quiesce.hpp) and then join the loop, so nothing runs on it after this point: the
+  // pump destroyed just below, and the storage_error pipe destroyed with the members, are both things
+  // a late callback would touch.
+  (void)run_on_loop_and_wait(loop_thread.event_loop(), []() {});
+  loop_thread.stop_and_join();
   if (owns_pump)
     dew_pump_destroy(pump);
 }
