@@ -134,6 +134,14 @@ struct dew_dataset_options_t
 //= nullable: options, pump
 DEW_ACCESS_EXPORT struct dew_dataset_t *dew_dataset_create(const char *url, uint32_t url_len, const char *connection, uint32_t connection_len, const struct dew_dataset_options_t *options, struct dew_pump_t *pump,
                                                            struct dew_error_t **error);
+/* Close the dataset and release everything it holds. BLOCKS: it cancels outstanding requests, JOINS
+ * the thread pool and stops the reader's loop, then destroys a private pump.
+ *
+ * Those are the same threads a wake fires on -- fire() runs the callback synchronously on whichever
+ * thread published the completion -- so a language binding must NOT hold a runtime lock that the
+ * wake callback needs. Under Python that lock is the GIL, and holding it here deadlocks: the join
+ * waits for a worker that is blocked acquiring the GIL inside the wake. */
+//= blocking
 //= py.drain_on_destroy: dew_dataset_close
 DEW_ACCESS_EXPORT void dew_dataset_close(struct dew_dataset_t *dataset);
 
