@@ -49,10 +49,12 @@
 #include <dew/render/renderer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -345,18 +347,35 @@ frame_summary_t run_frame(dew_renderer_t *renderer, dew_camera_t *camera, record
   return summary;
 }
 
+// Every wait below is bounded by the WALL CLOCK, never by a frame count.
+//
+// A frame with nothing to do costs microseconds: add_to_frame walks the tree, schedules IO and
+// returns, while the work it is waiting for happens elsewhere -- the blob read on the storage loop,
+// the morton decode on a convert_pool worker, and for anything below the root an extra async hop to
+// load the sub-tree. So "400 frames" was never a deadline, it was however fast this machine spins a
+// near-empty loop, and the spin steals the CPU from the very threads it is waiting on. Under ASan
+// (slower decode, fewer vCPUs) that window expired before the first node landed and the test read an
+// empty pipeline as a renderer bug. Pausing a millisecond per frame hands those threads the CPU and
+// makes the bound real time. The predicates are unchanged, so a genuine regression still fails -- it
+// just takes the timeout to say so.
+constexpr auto k_wait_timeout = std::chrono::seconds(30);
+constexpr auto k_frame_pause = std::chrono::milliseconds(1);
+
 // Streaming is asynchronous: the first frames walk the tree and issue loads, and points appear over
 // the following ones. So "render until it settles" is the only honest way to observe a steady state.
-frame_summary_t render_until_points(dew_renderer_t *renderer, dew_camera_t *camera, recording_consumer_t &consumer, int max_frames = 400)
+frame_summary_t render_until_points(dew_renderer_t *renderer, dew_camera_t *camera, recording_consumer_t &consumer)
 {
+  const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
   frame_summary_t last;
-  for (int i = 0; i < max_frames; i++)
+  for (int i = 0;; i++)
   {
     last = run_frame(renderer, camera, consumer);
     if (last.point_draw_size > 0 && i > 8)
       return last;
+    if (std::chrono::steady_clock::now() >= deadline)
+      return last;
+    std::this_thread::sleep_for(k_frame_pause);
   }
-  return last;
 }
 
 frame_summary_t render_frames(dew_renderer_t *renderer, dew_camera_t *camera, recording_consumer_t &consumer, int frames)
@@ -375,16 +394,19 @@ frame_summary_t render_frames(dew_renderer_t *renderer, dew_camera_t *camera, re
 // of these tests did: same binary, two runs, two answers. Waiting on the condition instead makes the
 // bound a timeout rather than a guess, and a genuine regression still fails because the predicate
 // never comes true.
-template <typename Predicate> frame_summary_t render_until(dew_renderer_t *renderer, dew_camera_t *camera, recording_consumer_t &consumer, Predicate predicate, int max_frames = 600)
+template <typename Predicate> frame_summary_t render_until(dew_renderer_t *renderer, dew_camera_t *camera, recording_consumer_t &consumer, Predicate predicate)
 {
+  const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
   frame_summary_t last;
-  for (int i = 0; i < max_frames; i++)
+  for (;;)
   {
     last = run_frame(renderer, camera, consumer);
     if (predicate(last))
       return last;
+    if (std::chrono::steady_clock::now() >= deadline)
+      return last;
+    std::this_thread::sleep_for(k_frame_pause);
   }
-  return last;
 }
 
 const char *k_path = "render_callback_test.dew";
@@ -504,28 +526,40 @@ TEST_CASE("render: moving closer refines the cloud")
 {
   // The streaming contract: a nearer camera means a finer LOD frontier, which means more uploaded
   // points -- not merely the same buffers redrawn.
+  // Measured on the FRONTIER (points actually drawn), not on consumer.initialized_bytes. That
+  // counter is cumulative for the whole session and re-counts every re-upload, so a node that fades
+  // out and back in inflates it without the frontier changing at all -- it never measured "how much
+  // the far view needed". Under ASan the far view churned enough to reach 1088144 bytes on its own,
+  // the close view then added nothing new, and the test failed with 1088144 > 1088144. Points drawn
+  // cannot be inflated that way, and it is what the contract above actually claims.
   render_fixture_t fixture;
   fixture.look_from(1, 1, 1, 6.0);
   render_until_points(fixture.renderer, fixture.camera, fixture.consumer);
-  // Let the far view reach a steady state: stop once a stretch of frames uploads nothing new.
+  // Let the far view reach a steady state: stop once the frontier stops growing for a stretch of
+  // real time. Frames, again, are not a clock -- 30 quiet frames is microseconds here and seconds
+  // under a sanitizer, which is why the two builds settled at wildly different points.
   uint64_t settled = 0;
-  int quiet = 0;
-  auto far_away = render_until(fixture.renderer, fixture.camera, fixture.consumer, [&](const frame_summary_t &) {
-    if (fixture.consumer.initialized_bytes == settled)
-      return ++quiet >= 30;
-    settled = fixture.consumer.initialized_bytes;
-    quiet = 0;
-    return false;
+  auto quiet_since = std::chrono::steady_clock::now();
+  auto far_away = render_until(fixture.renderer, fixture.camera, fixture.consumer, [&](const frame_summary_t &s) {
+    if (s.point_draw_size != settled)
+    {
+      settled = s.point_draw_size;
+      quiet_since = std::chrono::steady_clock::now();
+      return false;
+    }
+    return s.point_draw_size > 0 && std::chrono::steady_clock::now() - quiet_since >= std::chrono::milliseconds(500);
   });
-  const uint64_t bytes_when_far = fixture.consumer.initialized_bytes;
   REQUIRE(far_away.point_draw_size > 0);
+  const uint64_t points_when_far = far_away.point_draw_size;
 
   fixture.look_from(1, 1, 1, 0.9);
-  render_until(fixture.renderer, fixture.camera, fixture.consumer, [&](const frame_summary_t &) { return fixture.consumer.initialized_bytes > bytes_when_far; });
+  auto close_up = render_until(fixture.renderer, fixture.camera, fixture.consumer,
+                               [&](const frame_summary_t &s) { return s.point_draw_size > points_when_far; });
 
-  // More data had to be uploaded to serve the closer view.
-  MESSAGE("uploaded bytes far: ", bytes_when_far, "  after moving close: ", fixture.consumer.initialized_bytes);
-  REQUIRE(fixture.consumer.initialized_bytes > bytes_when_far);
+  // A finer frontier: the closer view draws strictly more points than the far one.
+  MESSAGE("points drawn far: ", points_when_far, "  after moving close: ", close_up.point_draw_size,
+          "  (uploaded bytes far/close: ", fixture.consumer.initialized_bytes, ")");
+  REQUIRE(close_up.point_draw_size > points_when_far);
 }
 
 TEST_CASE("render: buffer lifecycle balances across a full session")
