@@ -379,26 +379,35 @@ void dew_converter_data_source_t::add_to_frame(dew_frame_camera_t *c_camera, dew
       // never fit the band simply stays on its monolith -- the stable, intended fallback. fade_out nodes are
       // departing: destroying their monolith mid-crossfade would pop the region off screen (and the reload
       // would never run; build_render_list destroys non-uploaded fade-outs).
-      const size_t resident_estimate =
-        size_t(node.point_count) * (size_t(size_for_format(node.walker_data.format[0].type, node.walker_data.format[0].components)) + 3u * sizeof(float) +
-                                    (node.walker_data.locations[1].size > 0 ? size_t(size_for_format(node.walker_data.format[1].type, node.walker_data.format[1].components)) : 0u));
+      //
+      // The estimate reads node.point_count, which a convert_pool worker writes (convert_node_data)
+      // right up until it publishes convert_done. So compute it INSIDE the state guard, never before
+      // it: io_state == loaded is only set by the frame that observed convert_done with acquire, so
+      // by then the worker's write happens-before this read. Hoisted out, as it used to be, it read
+      // the field of every node still converting and raced the worker -- eight TSan reports.
       if (node.salvage_lost && !node.resident_handler && !node.resident_building && node.walker_data.frustum_visible &&
           node.fade_state != render_node_fade_state::fade_out &&
           node.gpu_state == render_node_gpu_state::uploaded && node.io_state == render_node_io_state::loaded &&
-          builds_left > 0 && resident_cpu_used + resident_estimate <= frame_cpu_resident_budget * 3 / 4)
+          builds_left > 0)
       {
-        --builds_left;             // a reload leads to a resident build soon; count it against the ramp
-        node.salvage_lost = false; // one-shot; re-armed only by another R5 eviction
-        recovery_fired = true;     // the reload starts NEXT frame's IO scan -> tick the host until it kicks in
-        for (auto &b : node.gpu_buffers)
-          if (b.user_ptr)
-            callbacks.do_destroy_buffer(b);
-        if (node.params_buffer.user_ptr)
-          callbacks.do_destroy_buffer(node.params_buffer);
-        node.gpu_state = render_node_gpu_state::none;
-        node.io_state = render_node_io_state::none;
-        node.gpu_memory_size = 0;
-        continue;
+        const size_t resident_estimate =
+          size_t(node.point_count) * (size_t(size_for_format(node.walker_data.format[0].type, node.walker_data.format[0].components)) + 3u * sizeof(float) +
+                                      (node.walker_data.locations[1].size > 0 ? size_t(size_for_format(node.walker_data.format[1].type, node.walker_data.format[1].components)) : 0u));
+        if (resident_cpu_used + resident_estimate <= frame_cpu_resident_budget * 3 / 4)
+        {
+          --builds_left;             // a reload leads to a resident build soon; count it against the ramp
+          node.salvage_lost = false; // one-shot; re-armed only by another R5 eviction
+          recovery_fired = true;     // the reload starts NEXT frame's IO scan -> tick the host until it kicks in
+          for (auto &b : node.gpu_buffers)
+            if (b.user_ptr)
+              callbacks.do_destroy_buffer(b);
+          if (node.params_buffer.user_ptr)
+            callbacks.do_destroy_buffer(node.params_buffer);
+          node.gpu_state = render_node_gpu_state::none;
+          node.io_state = render_node_io_state::none;
+          node.gpu_memory_size = 0;
+          continue;
+        }
       }
       if (node.is_virtual_source || node.resident_building || !node.resident_handler || node.gpu_state != render_node_gpu_state::uploaded)
         continue;

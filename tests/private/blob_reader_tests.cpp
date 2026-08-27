@@ -233,10 +233,13 @@ struct coro_probe_t
 
   void signal()
   {
-    {
-      std::unique_lock<std::mutex> lock(mutex);
-      finished = true;
-    }
+    // notify_all UNDER the lock, deliberately. The probe is a stack local in the test body, so the
+    // waiter destroys it as soon as wait() returns -- and if the notify happened after the unlock,
+    // that destructor could run while this thread was still inside notify_all(), destroying the
+    // condition variable out from under it. Holding the lock across the notify means the waiter
+    // cannot re-acquire, and so cannot leave wait(), until the notify has returned.
+    std::unique_lock<std::mutex> lock(mutex);
+    finished = true;
     cond.notify_all();
   }
   void wait()
