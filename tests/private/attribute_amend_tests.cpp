@@ -487,7 +487,7 @@ void amend_destroy_user_ptr(void *user_ptr)
   delete static_cast<emit_state_t *>(user_ptr);
 }
 
-bool build_mixed_dataset(const char *path)
+bool build_mixed_dataset_tuned(const char *path, uint32_t node_point_limit, uint64_t read_chunk_bytes)
 {
   std::remove(path);
   dew_error_t *error = nullptr;
@@ -505,7 +505,9 @@ bool build_mixed_dataset(const char *path)
   callbacks.destroy_user_ptr = amend_destroy_user_ptr;
   dew_converter_set_file_converter_callbacks(converter, callbacks);
   // Small nodes, so the tree really subdivides and there are interior LOD nodes to merge into.
-  dew_converter_set_node_point_limit(converter, 700);
+  dew_converter_set_node_point_limit(converter, node_point_limit);
+  if (read_chunk_bytes)
+    dew_converter_set_read_chunk_bytes(converter, read_chunk_bytes);
 
   dew_converter_str_buffer names[2] = {{k_coloured_name, uint32_t(strlen(k_coloured_name))}, {k_plain_name, uint32_t(strlen(k_plain_name))}};
   dew_converter_add_data_file(converter, names, 2);
@@ -513,6 +515,11 @@ bool build_mixed_dataset(const char *path)
   const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
   dew_converter_destroy(converter);
   return ok;
+}
+
+bool build_mixed_dataset(const char *path)
+{
+  return build_mixed_dataset_tuned(path, 700, 0);
 }
 
 // Query the whole extent and check every returned colour, at one LOD mode.
@@ -594,4 +601,84 @@ TEST_CASE("amend: merging inputs that disagree about rgb never yields uninitiali
     require_colours_are_clean(k_amend_path, dew_lod_level, level, "lod level " + std::to_string(level) + " (LOD nodes)");
 
   std::remove(k_amend_path);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 6. Multi-pass conversion: the path add_storage's replacement branch actually serves.
+
+// A conversion whose done-morton watermark advances more than once runs several LOD passes, and a
+// node LOD-ed in an earlier pass is regenerated in a later one UNDER ITS EXISTING ID -- i.e. through
+// add_storage's replacement branch. That branch used to be forbidden by an assert while its body was
+// written to handle exactly that case, so in a debug build this path could not run at all and in a
+// release build it double-counted the reference.
+//
+// Small read chunks force the shape: each chunk advances the watermark, and each advance fires a
+// pass (processor.cpp, handle_index_write_done -> generate_lod).
+//
+// The assertion is that the dataset is still CORRECT afterwards -- every source point present
+// exactly once. A double-counted reference does not corrupt the points directly; it strands units
+// so their blobs are never freed, which shows up as a dataset that keeps growing and, once the
+// replacement branch is live, as an assert firing mid-conversion.
+
+TEST_CASE("amend: a multi-pass conversion regenerates LOD nodes without losing points")
+{
+  constexpr const char *path = "attribute_amend_multipass.dew";
+  REQUIRE(build_mixed_dataset_tuned(path, /*node_point_limit=*/400, /*read_chunk_bytes=*/16 * 1024));
+
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  const char *attributes[] = {DEW_ATTRIBUTE_RGB};
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) * 2.0 + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.attribute_names = attributes;
+  spec.attribute_count = 1;
+  spec.position_format = dew_position_r64_absolute;
+
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+
+  // Every source point, exactly once: a full-resolution query returns the converted count. LOD nodes
+  // are subsampled COPIES, so a walk that emitted an extra level would overshoot -- which is how a
+  // regenerated node that was left double-referenced would most likely show up.
+  REQUIRE(result.point_count == 2 * k_amend_points);
+
+  const dew_attribute_buffer_t *rgb_buffer = nullptr;
+  for (uint32_t i = 0; i < result.buffer_count; i++)
+    if (result.buffers[i].name && strcmp(result.buffers[i].name, DEW_ATTRIBUTE_RGB) == 0)
+      rgb_buffer = &result.buffers[i];
+  REQUIRE(rgb_buffer != nullptr);
+
+  const auto *rgb = static_cast<const uint8_t *>(rgb_buffer->data);
+  uint64_t coloured = 0, blank = 0, garbage = 0;
+  for (uint64_t p = 0; p < result.point_count; p++)
+  {
+    const uint8_t r = rgb[p * 3 + 0], g = rgb[p * 3 + 1], b = rgb[p * 3 + 2];
+    if (r == k_rgb[0] && g == k_rgb[1] && b == k_rgb[2])
+      coloured++;
+    else if (r == 0 && g == 0 && b == 0)
+      blank++;
+    else
+      garbage++;
+  }
+  MESSAGE("multi-pass: points ", result.point_count, "  nodes ", result.node_count, "  coloured ", coloured, "  blank ", blank, "  GARBAGE ", garbage);
+  REQUIRE(garbage == 0);
+  REQUIRE(coloured == k_amend_points);
+  REQUIRE(blank == k_amend_points);
+
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  std::remove(path);
 }

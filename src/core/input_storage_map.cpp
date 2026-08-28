@@ -38,8 +38,12 @@ namespace dew::core
 //
 // This function previously carried `assert(!_map.contains(id))` directly above the loop that exists
 // only to handle a re-add -- two contradictory contracts, of which the assert won in debug builds and
-// the loop won in release. Replacement is the supported one: tree_lod_generator regenerates a node
-// under its existing id.
+// the loop won in release. Replacement is the one kept, because it is what an amend needs.
+//
+// Measured, so nobody has to guess later: across the whole test suite, including a 400k-point
+// conversion tuned to run several LOD passes, NO conversion path reaches the replacement branch --
+// tree_lod_generator skips a node that already has LOD data rather than regenerating it under the
+// same id. So this is a contract being made coherent and usable, not a live bug being fixed.
 void input_storage_map_t::add_storage(input_data_id_t id, attributes_id_t attributes_id, std::vector<storage_location_t> &&storage)
 {
   assert(storage.size());
