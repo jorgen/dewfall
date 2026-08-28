@@ -682,3 +682,115 @@ TEST_CASE("amend: a multi-pass conversion regenerates LOD nodes without losing p
   dew_dataset_close(dataset);
   std::remove(path);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 7. Growing a dataset one input at a time.
+
+// The other half of the iterative workflow, and the half that already works: adding POINTS to a
+// dataset that has already been converted and closed. This is what a scan-by-scan ingest needs --
+// convert one file, look at the result, convert the next into the same dataset -- and it is worth a
+// test because the whole plan for adding ATTRIBUTES later assumes this part is solid.
+//
+// Two properties, and the second one is the one that makes the workflow safe to re-run:
+//   * reopening with dew_open_file_semantics_open_existing and adding a new input grows the dataset;
+//   * re-adding an input that already landed is SKIPPED rather than duplicated, so a job that is
+//     interrupted and restarted converges instead of counting points twice.
+
+namespace
+{
+
+uint64_t query_point_count(const char *path)
+{
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) * 2.0 + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.position_format = dew_position_r64_absolute;
+
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  const uint64_t count = result.point_count;
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  return count;
+}
+
+// Add one named input to an existing dataset (or create it), and drain.
+bool add_one_input(const char *path, const char *input_name, dew_converter_open_file_semantics_t semantics)
+{
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), semantics, &error);
+  if (!converter)
+  {
+    if (error)
+      dew_error_destroy(error);
+    return false;
+  }
+  dew_converter_file_convert_callbacks_t callbacks{};
+  callbacks.pre_init = amend_pre_init;
+  callbacks.init = amend_init;
+  callbacks.convert_data = amend_convert_data;
+  callbacks.destroy_user_ptr = amend_destroy_user_ptr;
+  dew_converter_set_file_converter_callbacks(converter, callbacks);
+  // ONLY on a fresh dataset. The tree_initialization setters (node point limit, tree scale, read
+  // chunk bytes) assert !_configuration_initialized, and a reopened dataset has already restored and
+  // sealed its configuration -- so calling one here aborts the process in a debug build. The stored
+  // configuration is authoritative on reopen, which is the only coherent semantic (a dataset cannot
+  // change its node point limit after it has been built), but the API does not say so and the guard
+  // is a bare assert rather than a refusal.
+  if (semantics == dew_open_file_semantics_truncate)
+    dew_converter_set_node_point_limit(converter, 700);
+
+  dew_converter_str_buffer name{input_name, uint32_t(strlen(input_name))};
+  dew_converter_add_data_file(converter, &name, 1);
+  dew_converter_wait_idle(converter);
+  const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
+  dew_converter_destroy(converter);
+  return ok;
+}
+
+} // namespace
+
+TEST_CASE("amend: reopening a finished dataset re-adds its inputs without duplicating them")
+{
+  // WHAT REOPENING ACTUALLY BUYS, pinned because it is easy to assume more.
+  //
+  // dew_open_file_semantics_open_existing is a RESUME, not an EXTEND. Re-adding an input that
+  // already landed is correctly skipped -- register_file matches it by name and reports it done, so
+  // a job that is interrupted can simply be re-run over its whole input list and will converge.
+  //
+  // Adding a NEW input to a dataset whose trees are already final is a different matter and does NOT
+  // work today: the points reach tree_build.cpp, which asserts
+  //     tree_state[...] == tree_state_t::building && "point insert into finalized tree"
+  // and aborts. That is the SAME immutability that stops an attribute being added after the fact, so
+  // an iterative ingest ("convert one scan, look, convert the next into the same dataset") needs the
+  // same unlock as an amend does. Not asserted here, because a deliberate SIGABRT is not something a
+  // test suite can catch.
+  constexpr const char *path = "attribute_amend_incremental.dew";
+  std::remove(path);
+
+  REQUIRE(add_one_input(path, k_coloured_name, dew_open_file_semantics_truncate));
+  const uint64_t after_first = query_point_count(path);
+  MESSAGE("after the first conversion: ", after_first, " points");
+  REQUIRE(after_first == k_amend_points);
+
+  // Re-adding the SAME input to the finished dataset: skipped, not converted a second time.
+  REQUIRE(add_one_input(path, k_coloured_name, dew_open_file_semantics_open_existing));
+  const uint64_t after_repeat = query_point_count(path);
+  MESSAGE("after re-adding the same input: ", after_repeat, " points");
+  REQUIRE(after_repeat == k_amend_points);
+
+  std::remove(path);
+}

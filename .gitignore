@@ -17,6 +17,7 @@ access_query_test.dew
 blob_reader_test_cache_file
 converter_teardown_*.dew
 converter_preinit_dispatch_race.dew
+attribute_amend_*.dew
 cpp_await_test.dew
 dewpp_test.dew
 render_callback_test.dew
