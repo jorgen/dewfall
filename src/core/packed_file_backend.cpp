@@ -503,6 +503,13 @@ vio::task_t<dew_error_t> packed_file_backend_t::read_blob(storage_location_t loc
           error.code = result.error().code;
           error.msg = result.error().msg;
         }
+        else if (result.value() != location.size)
+        {
+          // Short read: the blob is not all there. Reporting success would hand the caller a buffer
+          // whose tail it never wrote -- see the note on object_backend_t::read_blob.
+          error.code = 1;
+          error.msg = "Could not read the entire blob";
+        }
         else
         {
           bytes_read = uint32_t(result.value());

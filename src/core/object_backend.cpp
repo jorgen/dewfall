@@ -295,6 +295,14 @@ vio::task_t<dew_error_t> object_backend_t::read_blob(storage_location_t location
                  : co_await _io->read_object_all(object_name(location.file_id, location.offset), dst, location.size);
   if (!r.has_value())
     co_return to_points_error(r.error());
+  // A SHORT read is a failure, not a partial success. The object is supposed to BE the blob, so
+  // fewer bytes means a truncated object -- and a caller that trusts location.size then hands the
+  // unwritten tail of its buffer onward: `dew copy` wrote it straight into the destination dataset
+  // (uninitialized heap published into an object store) and fed it to tree_deserialize. Every
+  // sibling read already rejects this (read_location just above, packed_file_backend's remote path,
+  // co_read_into_buffer); read_blob was the one that did not.
+  if (r.value() != location.size)
+    co_return dew_error_t{1, "Data object is shorter than its recorded location"};
   bytes_read = uint32_t(r.value());
   co_return dew_error_t{};
 }
