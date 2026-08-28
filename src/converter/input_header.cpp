@@ -23,6 +23,12 @@ namespace dew::converter
 {
 using namespace dew::core;
 
+// ZERO-INITIALIZED, not merely allocated. A destination attribute set is the UNION of its sources'
+// attributes, and a source that lacks one contributes NOTHING to that buffer -- the LOD generator
+// skips it (tree_lod_generator.cpp, source_index < 0). Those points' bytes are never written, so
+// with `new uint8_t[n]` (default-initialization, i.e. none for a scalar) they would carry whatever
+// was on the heap straight into the dataset. Zero is the same value dew_access substitutes for an
+// absent attribute, so the two paths now agree.
 void attribute_buffers_initialize(const std::vector<point_format_t> &attributes_def, attribute_buffers_t &buffers, uint32_t point_count)
 {
   buffers.data.reserve(attributes_def.size());
@@ -30,7 +36,7 @@ void attribute_buffers_initialize(const std::vector<point_format_t> &attributes_
   for (auto &attribute : attributes_def)
   {
     uint32_t buffer_size = size_for_format(attribute.type) * uint32_t(attribute.components) * point_count;
-    buffers.data.emplace_back(new uint8_t[buffer_size]);
+    buffers.data.emplace_back(new uint8_t[buffer_size]());
     buffers.buffers.emplace_back(buffers.data.back().get(), buffer_size);
   }
 }
@@ -50,7 +56,7 @@ void attribute_buffers_initialize(const std::vector<point_format_t> &attributes_
     }
     else
     {
-      buffers.data.emplace_back(new uint8_t[buffer_size]);
+      buffers.data.emplace_back(new uint8_t[buffer_size]()); // zeroed: see the overload above
     }
     buffers.buffers.emplace_back(buffers.data.back().get(), buffer_size);
   }

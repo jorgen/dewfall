@@ -37,6 +37,7 @@ add_executable(private_interface_unit_tests
         private/pump_tests.cpp
         private/access_query_tests.cpp
         private/converter_teardown_tests.cpp
+        private/attribute_amend_tests.cpp
         $<TARGET_OBJECTS:dew_access_objects>
 )
 target_link_libraries(private_interface_unit_tests PRIVATE dew::await vio_objstore libzstd_static)
