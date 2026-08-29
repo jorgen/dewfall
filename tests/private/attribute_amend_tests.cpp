@@ -43,6 +43,7 @@
 // the moment half a dataset has been amended.
 
 #include <chrono>
+#include <tuple>
 
 #include <doctest/doctest.h>
 
@@ -1784,5 +1785,132 @@ TEST_CASE("amend: declaring an attribute on a dataset that is not mutable is ref
   CHECK(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 0);
   CHECK(dew_converter_status(converter) == dew_conversion_status_error);
   dew_converter_destroy(converter);
+  std::remove(path);
+}
+
+TEST_CASE("amend: an amended attribute survives a later LOD pass")
+{
+  // THE DURABILITY QUESTION. An amend writes one blob per unit and appends it to that unit's
+  // config. A later LOD pass REPLACES an LOD unit's storage wholesale (tree_lod_generator takes the
+  // add_storage replacement branch) and rebuilds its config as the union of its children's, then
+  // slims. So: does an attribute added by an amend still exist after the pyramid is regenerated?
+  //
+  // It matters because a mutable dataset is exactly the kind that gets more input later, and adding
+  // input lowers the LOD floor and re-runs the pass over everything the new points touch.
+  constexpr const char *path = "attribute_amend_relod.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  {
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+    REQUIRE(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 1);
+    std::vector<uint64_t> keys(k_amend_points);
+    std::vector<float> values(k_amend_points);
+    for (uint32_t k = 0; k < k_amend_points; k++)
+    {
+      keys[k] = k;
+      values[k] = expected_value(k);
+    }
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data(), values.data(), k_amend_points) == 1);
+    dew_converter_commit_attributes(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_destroy(converter);
+  }
+
+  const auto coarse_reflectance = [&](const char *stage) {
+    dew_error_t *error = nullptr;
+    auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+    REQUIRE(dataset != nullptr);
+    REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+    const char *attributes[] = {k_key_name, k_amended_attribute};
+    dew_region_request_t spec{};
+    for (int i = 0; i < 3; i++)
+    {
+      spec.aabb_min[i] = -1.0;
+      spec.aabb_max[i] = double(k_amend_grid) + 1.0;
+    }
+    spec.lod_mode = dew_lod_level;
+    spec.lod = 5; // tree 0's deepest level -- a frontier of LOD nodes, not leaves
+    spec.clip_mode = dew_clip_node;
+    spec.attribute_names = attributes;
+    spec.attribute_count = 2;
+    spec.position_format = dew_position_r64_absolute;
+    auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+    REQUIRE(request != nullptr);
+    REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+    dew_request_result_t result{};
+    REQUIRE(dew_request_get_result(request, &result) == 1);
+
+    const dew_attribute_buffer_t *key_buffer = nullptr;
+    const dew_attribute_buffer_t *value_buffer = nullptr;
+    for (uint32_t i = 0; i < result.buffer_count; i++)
+    {
+      if (!result.buffers[i].name)
+        continue;
+      if (strcmp(result.buffers[i].name, k_key_name) == 0)
+        key_buffer = &result.buffers[i];
+      else if (strcmp(result.buffers[i].name, k_amended_attribute) == 0)
+        value_buffer = &result.buffers[i];
+    }
+    uint64_t correct = 0, wrong = 0, zero = 0;
+    if (key_buffer && value_buffer && value_buffer->size_bytes)
+    {
+      const auto *keys = static_cast<const uint32_t *>(key_buffer->data);
+      const auto *values = static_cast<const float *>(value_buffer->data);
+      for (uint64_t p = 0; p < result.point_count; p++)
+      {
+        if (keys[p] < k_amend_points && values[p] == expected_value(keys[p]))
+          correct++;
+        else if (values[p] == 0.0f)
+          zero++;  // a point the amend never covered reads as zero; that is the contract, not damage
+        else
+          wrong++;
+      }
+    }
+    MESSAGE(stage, ": ", result.point_count, " coarse points, reflectance ", value_buffer ? "present" : "ABSENT", ", ", correct, " correct, ", zero, " zero (never amended), ", wrong, " WRONG");
+    const uint64_t points = result.point_count;
+    dew_request_release(request);
+    dew_dataset_close(dataset);
+    return std::make_tuple(points, correct, wrong, value_buffer != nullptr && value_buffer->size_bytes != 0);
+  };
+
+  auto before = coarse_reflectance("after the amend");
+  REQUIRE(std::get<3>(before));
+  REQUIRE(std::get<0>(before) > 0);
+  CHECK(std::get<2>(before) == 0);
+  CHECK(std::get<1>(before) == std::get<0>(before));
+
+  // Now GROW the dataset. A new input lowers the LOD floor, so the pass re-runs over everything the
+  // new points touch -- which, since this input covers the same cell, is the whole pyramid.
+  {
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+    constexpr const char *second = "keyed-second";
+    dew_converter_str_buffer name{second, uint32_t(strlen(second))};
+    dew_converter_add_data_file(converter, &name, 1);
+    dew_converter_wait_idle(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_finalize(converter);
+    dew_converter_destroy(converter);
+  }
+
+  auto after = coarse_reflectance("after adding an input (re-LOD)");
+  // The attribute must still be there, and still right. If a regenerated LOD node dropped it, the
+  // buffer comes back absent or zero-filled -- the amend would be a one-shot on any dataset that
+  // ever grows again, which is precisely the kind an amend runs on.
+  // Still present, and no point may hold a value that is neither its own nor zero. Zeros ARE
+  // expected: the second input's points were never amended, and a point with no table entry reads as
+  // zero by contract. What would be damage is a point carrying some OTHER point's value, which is
+  // what a regenerated LOD node produces if the amend's slot mapping does not survive.
+  CHECK(std::get<3>(after));
+  CHECK(std::get<2>(after) == 0);
+  CHECK(std::get<1>(after) > 0);
+
   std::remove(path);
 }
