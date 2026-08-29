@@ -41,6 +41,11 @@ class input_storage_map_t
 {
 public:
   void add_storage(input_data_id_t id, attributes_id_t attributes_id, std::vector<storage_location_t> &&storage);
+  // A unit GAINS an attribute: keep every blob it already has and append the new one, moving it to
+  // `attributes_id` (which must be its old config with the attribute appended, so existing slot
+  // indices still address the same blobs). Distinct from add_storage, which replaces the vector and
+  // discards what was there. Does not change the reference count.
+  void append_storage(input_data_id_t id, attributes_id_t attributes_id, std::vector<storage_location_t> &&extra);
   std::pair<attributes_id_t, std::vector<storage_location_t>> dereference(input_data_id_t id);
   // As dereference, but when the last reference drops the locations are recorded as discarded
   // (see take_discarded) instead of handed to the caller. For call sites that abandon the blobs.

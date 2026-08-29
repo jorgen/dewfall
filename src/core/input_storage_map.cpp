@@ -58,6 +58,32 @@ void input_storage_map_t::add_storage(input_data_id_t id, attributes_id_t attrib
   if (!replacing)
     value.ref_count++;
 }
+void input_storage_map_t::append_storage(input_data_id_t id, attributes_id_t attributes_id, std::vector<storage_location_t> &&extra)
+{
+  // A unit GAINS an attribute: the blobs it already has stay exactly where they are, and the new one
+  // is appended. Deliberately not add_storage, which replaces the whole vector and discards whatever
+  // was there -- correct for a regenerated LOD node, catastrophic here, because the discarded blobs
+  // would be the unit's positions and every attribute it already carried.
+  //
+  // The reference count is untouched for the same reason it is on a replacement: this re-describes a
+  // unit that is already referenced, it does not add a reference.
+  //
+  // `attributes_id` must be the OLD config with the new attribute appended, so every existing slot
+  // index still addresses the blob it always did. Readers resolve an attribute by name against the
+  // node's own config and index this vector with the result, so a config whose order does not match
+  // it mis-maps every attribute of the unit.
+  assert(!extra.empty());
+  auto it = _map.find(id);
+  assert(it != _map.end() && "append_storage on a unit that has no storage");
+  if (it == _map.end())
+    return;
+  auto &value = it->second;
+  value.attributes_id = attributes_id;
+  value.storage.reserve(value.storage.size() + extra.size());
+  for (auto &location : extra)
+    value.storage.push_back(location);
+}
+
 void input_storage_map_t::dereference_discard(input_data_id_t id)
 {
   assert(_map.contains(id));

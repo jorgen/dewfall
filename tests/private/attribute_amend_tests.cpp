@@ -53,6 +53,7 @@
 #include <dew/core/format.h>
 #include <dew/core/types.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1166,4 +1167,183 @@ TEST_CASE("mutable: a finalized dataset matches one converted in a single pass")
 
   std::remove(one_path);
   std::remove(many_path);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 12. The write primitive an amend needs: a unit gaining a slot.
+
+TEST_CASE("amend: append_storage keeps the existing blobs and adds one")
+{
+  // What add_storage CANNOT do. It replaces the whole location vector and pushes whatever was there
+  // onto the discard list -- right for a regenerated LOD node, fatal for an amend, where the blobs
+  // being discarded would be the unit's positions and every attribute it already carried.
+  input_storage_map_t map;
+  const input_data_id_t id{11, 0};
+  const auto positions = make_location(0, 1000, 64);
+  const auto intensity = make_location(0, 2000, 32);
+  const auto rgb = make_location(0, 3000, 48);
+
+  map.add_storage(id, attributes_id_t{1}, {positions, intensity});
+  REQUIRE(map.take_discarded().empty());
+
+  map.append_storage(id, attributes_id_t{2}, {rgb});
+
+  // Everything that was there, in the same slots, plus the new one at the end. Order is the whole
+  // contract: readers resolve a name against the config and index this vector with the result, so a
+  // reordered vector mis-maps every attribute of the unit.
+  const auto stored = map.info(id).second;
+  REQUIRE(stored.size() == 3);
+  CHECK(stored[0].offset == positions.offset);
+  CHECK(stored[1].offset == intensity.offset);
+  CHECK(stored[2].offset == rgb.offset);
+  CHECK(map.attribute_id(id).data == 2);
+
+  // And critically: NOTHING was discarded. add_storage in the same position would have thrown the
+  // positions and intensity blobs onto the freed list, and the next checkpoint would have reused
+  // that space while the unit still pointed at it.
+  CHECK(map.take_discarded().empty());
+
+  // Still one reference: appending a slot re-describes a unit, it does not add a reference.
+  CHECK(map.ref_count(id) == 1);
+  map.dereference(id);
+  CHECK(!map.contains(id));
+}
+
+TEST_CASE("amend: an appended slot survives the round trip beside units that never gained one")
+{
+  // The half-amended state, on disk. A partially attributed dataset is legal -- readers resolve per
+  // node and zero-fill what a node lacks -- so an amend must be interruptible and resumable, which
+  // means the mixed widths have to persist.
+  input_storage_map_t map;
+  const input_data_id_t amended{1, 0};
+  const input_data_id_t untouched{2, 0};
+
+  map.add_storage(amended, attributes_id_t{5}, {make_location(0, 100, 10), make_location(0, 200, 20)});
+  map.add_storage(untouched, attributes_id_t{5}, {make_location(0, 300, 30), make_location(0, 400, 40)});
+  map.append_storage(amended, attributes_id_t{6}, {make_location(1, 500, 50)});
+
+  std::vector<uint8_t> buffer(map.serialized_size());
+  const auto written = map.serialize(buffer.data(), buffer.data() + buffer.size());
+  REQUIRE(written.first);
+
+  input_storage_map_t restored;
+  REQUIRE(restored.deserialize(buffer.data(), buffer.data() + buffer.size()).first);
+
+  REQUIRE(restored.info(amended).second.size() == 3);
+  REQUIRE(restored.info(untouched).second.size() == 2);
+  CHECK(restored.attribute_id(amended).data == 6);
+  CHECK(restored.attribute_id(untouched).data == 5);
+  CHECK(restored.location(amended, 2).offset == 500);
+  MESSAGE("after round trip: amended has ", restored.info(amended).second.size(), " slots, untouched has ", restored.info(untouched).second.size());
+}
+
+// ---------------------------------------------------------------------------------------------
+// 13. Destination mode: nothing ships while mutable, everything ships on finalize.
+
+// Hermetically skipped unless DEW_TEST_S3 is set, same convention as cloud_io_live_test.cpp. Against
+// a local minio:
+//   docker run -d --name dew-minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
+//     -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+//   docker run --rm --network host --entrypoint sh minio/mc -c \
+//     "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb --ignore-existing local/pointstest"
+//   DEW_TEST_S3=1 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+//     AWS_ENDPOINT_URL=http://127.0.0.1:9000 AWS_REGION=us-east-1 \
+//     ./private_interface_unit_tests -tc="mutable: destination*"
+//
+// What this covers that no local test can: mutable suppresses emit_band_job, so a mutable dataset in
+// destination mode must upload NOTHING -- a tree that has been banded and evicted from the cache is
+// exactly the tree an amend can no longer read. finalize re-enables it, and only then does the
+// bucket get a complete, readable dataset.
+
+namespace
+{
+
+// One input into a destination-mode dataset, mutable unless told otherwise.
+bool add_one_input_to_destination(const char *cache_path, const std::string &destination, const char *input_name, dew_converter_open_file_semantics_t semantics, bool make_mutable, bool finalize)
+{
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create_with_destination(cache_path, strlen(cache_path), destination.c_str(), destination.size(), nullptr, 0, semantics, &error);
+  if (!converter)
+  {
+    if (error)
+      dew_error_destroy(error);
+    return false;
+  }
+  if (make_mutable)
+    dew_converter_set_mutable(converter, 1);
+  dew_converter_file_convert_callbacks_t callbacks{};
+  callbacks.pre_init = amend_pre_init;
+  callbacks.init = amend_init;
+  callbacks.convert_data = amend_convert_data;
+  callbacks.destroy_user_ptr = amend_destroy_user_ptr;
+  dew_converter_set_file_converter_callbacks(converter, callbacks);
+  if (semantics == dew_open_file_semantics_truncate)
+    dew_converter_set_node_point_limit(converter, 700);
+
+  if (input_name)
+  {
+    dew_converter_str_buffer name{input_name, uint32_t(strlen(input_name))};
+    dew_converter_add_data_file(converter, &name, 1);
+  }
+  if (finalize)
+    dew_converter_finalize(converter);
+  else
+    dew_converter_wait_idle(converter);
+  const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
+  dew_converter_destroy(converter);
+  return ok;
+}
+
+} // namespace
+
+TEST_CASE("mutable: destination mode ships nothing until finalize")
+{
+  if (!std::getenv("DEW_TEST_S3"))
+    return; // hermetic skip when no object store is configured
+
+  const std::string bucket = std::getenv("DEW_TEST_S3_BUCKET") ? std::getenv("DEW_TEST_S3_BUCKET") : "pointstest";
+  const std::string destination = "s3://" + bucket + "/mutable_flow";
+  constexpr const char *cache = "attribute_amend_bucket_cache.dew";
+  std::remove(cache);
+
+  // Session 1, mutable: converts locally, uploads nothing.
+  REQUIRE(add_one_input_to_destination(cache, destination, k_coloured_name, dew_open_file_semantics_truncate, true, false));
+  // The cache is a complete, readable dataset even though the bucket has nothing.
+  REQUIRE(query_point_count(cache) == k_amend_points);
+
+  // Session 2, still mutable: grows it.
+  REQUIRE(add_one_input_to_destination(cache, destination, k_plain_name, dew_open_file_semantics_open_existing, true, false));
+  REQUIRE(query_point_count(cache) == 2 * k_amend_points);
+
+  // Finalize: seal, then ship. No new input.
+  REQUIRE(add_one_input_to_destination(cache, destination, nullptr, dew_open_file_semantics_open_existing, false, true));
+
+  // The bucket now holds a dataset that opens and reads on its own -- which is only true if the
+  // terminal band landed, i.e. if finalize really did re-enable band emission.
+  MESSAGE("reading back from ", destination);
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(destination.c_str(), uint32_t(destination.size()), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) * 2.0 + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.position_format = dew_position_r64_absolute;
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  MESSAGE("from the bucket: ", result.point_count, " points");
+  CHECK(result.point_count == 2 * k_amend_points);
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+
+  std::remove(cache);
 }
