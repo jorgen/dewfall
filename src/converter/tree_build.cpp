@@ -223,6 +223,17 @@ static void sub_tree_insert_points(tree_registry_t &tree_cache, storage_handler_
   // upload/eviction tiers treat as frozen.
   assert(tree_cache.tree_state[tree_id.data] == uint8_t(tree_state_t::building) && "point insert into finalized tree");
   tree->is_dirty = true;
+  // Every tree the points pass through, not just the one tree_add_points was handed. Its caller
+  // clears this on the ROOT tree only, and the leaf data actually lands in whichever sub-tree the
+  // routing reaches -- so clearing it there left the sub-trees claiming to be collapsed.
+  //
+  // Invisible in a fresh conversion, where a newly created tree starts false and only turns true
+  // once collapse has run. On a reopened dataset tree_compute_leaves_collapsed sets it true for
+  // every loaded tree, so collapse then SKIPPED every sub-tree that gained data: its leaves kept the
+  // new chunk as a second subset instead of merging it in. Measured on two inputs added in two
+  // sessions -- 80 leaf subsets where one session produces 40, with 40 leaves holding two each.
+  // That also shifts the LOD sampling, because find_indices_to_quantize runs per subset.
+  tree->leaves_collapsed = false;
   assert(tree->id.data < tree_cache.current_id);
   assert(current_level != 0 || tree->morton_min == min);
   assert(tree->mins[current_level][skip] == min);

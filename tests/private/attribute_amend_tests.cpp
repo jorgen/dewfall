@@ -970,3 +970,111 @@ TEST_CASE("mutable: a second session can add a new input to an existing dataset"
 
   std::remove(path);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 10. Two sessions must produce the same dataset as one.
+
+namespace
+{
+
+struct colour_census_t
+{
+  uint64_t points = 0;
+  uint32_t nodes = 0;
+  uint64_t coloured = 0;
+  uint64_t blank = 0;
+  uint64_t garbage = 0;
+};
+
+colour_census_t census_at(const char *path, dew_lod_mode_t lod_mode, int32_t lod)
+{
+  colour_census_t out;
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  const char *attributes[] = {DEW_ATTRIBUTE_RGB};
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) * 2.0 + 1.0;
+  }
+  spec.lod_mode = lod_mode;
+  spec.lod = lod;
+  spec.clip_mode = dew_clip_node;
+  spec.attribute_names = attributes;
+  spec.attribute_count = 1;
+  spec.position_format = dew_position_r64_absolute;
+
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+
+  out.points = result.point_count;
+  out.nodes = result.node_count;
+  const dew_attribute_buffer_t *rgb_buffer = nullptr;
+  for (uint32_t i = 0; i < result.buffer_count; i++)
+    if (result.buffers[i].name && strcmp(result.buffers[i].name, DEW_ATTRIBUTE_RGB) == 0)
+      rgb_buffer = &result.buffers[i];
+  REQUIRE(rgb_buffer != nullptr);
+  const auto *rgb = static_cast<const uint8_t *>(rgb_buffer->data);
+  for (uint64_t p = 0; p < result.point_count; p++)
+  {
+    const uint8_t r = rgb[p * 3 + 0], g = rgb[p * 3 + 1], b = rgb[p * 3 + 2];
+    if (r == k_rgb[0] && g == k_rgb[1] && b == k_rgb[2])
+      out.coloured++;
+    else if (r == 0 && g == 0 && b == 0)
+      out.blank++;
+    else
+      out.garbage++;
+  }
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("mutable: two sessions produce the same dataset as one")
+{
+  // The property that makes a mutable ingest trustworthy: HOW the input arrived must not change
+  // WHAT is stored. The same two inputs, once in a single conversion and once split across two
+  // sessions with the dataset closed in between, must agree -- at full resolution and at every
+  // coarse frontier.
+  //
+  // This is what caught the collapse bug. sub_tree_insert_points only cleared leaves_collapsed on
+  // the tree it was handed, not on the sub-trees the routing actually reached, and on a reopened
+  // dataset those all come back true from tree_compute_leaves_collapsed. Collapse then skipped
+  // them, leaving each touched leaf holding two subsets instead of one merged unit -- 80 leaf
+  // subsets against one session's 40. Since find_indices_to_quantize runs per subset, that also
+  // moved the LOD representative picks: level 3 came out 832/2624 coloured/blank instead of
+  // 1896/1560, from the same 16000 points.
+  constexpr const char *one_path = "attribute_amend_equiv_one.dew";
+  constexpr const char *two_path = "attribute_amend_equiv_two.dew";
+  std::remove(one_path);
+  std::remove(two_path);
+
+  REQUIRE(build_mixed_dataset_tuned(one_path, 700, 0));
+  REQUIRE(add_one_input_mutable(two_path, k_coloured_name, dew_open_file_semantics_truncate));
+  REQUIRE(add_one_input_mutable(two_path, k_plain_name, dew_open_file_semantics_open_existing));
+
+  for (int32_t lod = 0; lod <= 4; lod++)
+  {
+    const auto a = census_at(one_path, lod == 0 ? dew_lod_full : dew_lod_level, lod);
+    const auto b = census_at(two_path, lod == 0 ? dew_lod_full : dew_lod_level, lod);
+    MESSAGE("lod ", lod, ": one=[pts ", a.points, " nodes ", a.nodes, " col ", a.coloured, " blank ", a.blank, "]  two=[pts ", b.points, " nodes ", b.nodes, " col ", b.coloured, " blank ", b.blank, "]");
+    CHECK(a.points == b.points);
+    CHECK(a.nodes == b.nodes);
+    CHECK(a.coloured == b.coloured);
+    CHECK(a.blank == b.blank);
+    CHECK(a.garbage == 0);
+    CHECK(b.garbage == 0);
+  }
+
+  std::remove(one_path);
+  std::remove(two_path);
+}
