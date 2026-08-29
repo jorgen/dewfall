@@ -65,6 +65,18 @@ struct compressed_write_data_t
 
 class storage_handler_t;
 
+// One attribute buffer destined for a unit that ALREADY has storage. Parallel to one entry of an
+// attribute_buffers_t, minus everything a whole-unit write needs and an amend does not.
+struct attribute_write_t
+{
+  std::shared_ptr<uint8_t[]> data;
+  uint32_t size = 0;
+  uint32_t point_count = 0;
+  point_format_t format{};
+  std::string attribute_name;
+  bool is_lod = false;
+};
+
 class storage_handler_t
 {
 public:
@@ -82,6 +94,22 @@ public:
 
   void write(const storage_header_t &header, attributes_id_t attributes_id, attribute_buffers_t &&buffers,
              std::function<void(const storage_header_t &, attributes_id_t, std::vector<storage_location_t>, const dew_error_t &error)> done);
+  // Write attribute buffers for units that already exist, and hand back just their locations, one per
+  // input in order.
+  //
+  // write() above is the whole-unit path: it re-serializes slot 0 (the storage_header_t and the
+  // morton codes travel with the position buffer) and compresses every buffer it is given. An amend
+  // adds one attribute to units whose other blobs are already on disk and unchanged, so routing it
+  // through write() would recompress all of them and mint new locations for blobs nobody asked to
+  // move. This compresses and writes exactly the buffers handed to it, with the same preprocessing,
+  // the same constant-band detection and the same compression-stats accounting.
+  //
+  // Never slot 0 -- only the whole-unit path knows how to build a position buffer's header.
+  //
+  // Batched deliberately: an amend touches many units at once, and one call per unit would serialize
+  // the compression of thousands of buffers behind one another. The whole batch goes to the thread
+  // pool in one shot, exactly as a single unit's buffers do.
+  void write_attributes(std::vector<attribute_write_t> &&writes, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &error)> done);
   void write_trees(std::vector<tree_id_t> &&tree_ids, std::vector<serialized_tree_t> &&serialized_trees, std::function<void(std::vector<tree_id_t> &&, std::vector<storage_location_t> &&, dew_error_t &&error)> done);
   void write_tree_registry(serialized_tree_registry_t &&serialized_tree_registry, std::function<void(storage_location_t, dew_error_t &&error)> done);
   void write_blob_locations_and_update_header(storage_location_t location, std::vector<storage_location_t> &&old_locations, std::function<void(dew_error_t &&error)> done);
@@ -158,6 +186,8 @@ private:
   vio::task_t<void> do_write(const std::shared_ptr<uint8_t[]> &data, const storage_location_t &location);
   vio::task_t<void> do_write_events(storage_header_t header, attributes_id_t attributes_id, attribute_buffers_t attribute_buffers,
                                     std::function<void(const storage_header_t &, attributes_id_t, std::vector<storage_location_t> &&, const dew_error_t &error)> done);
+  void handle_write_attributes(std::tuple<std::vector<attribute_write_t>, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &)>> &&event);
+  vio::task_t<void> do_write_attributes(std::vector<attribute_write_t> writes, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &)> done);
   vio::task_t<void> do_write_trees(std::vector<tree_id_t> tree_ids, std::vector<serialized_tree_t> serialized_trees,
                                    std::function<void(std::vector<tree_id_t> &&, std::vector<storage_location_t> &&, dew_error_t &&)> done);
   vio::task_t<void> do_write_tree_registry(serialized_tree_registry_t serialized_tree_registry, std::function<void(storage_location_t, dew_error_t &&error)> done);
@@ -183,6 +213,7 @@ private:
   vio::event_pipe_t<void> &_index_written;
   vio::event_pipe_t<dew_error_t> &_storage_error;
   vio::event_pipe_t<std::tuple<storage_header_t, attributes_id_t, attribute_buffers_t, std::function<void(const storage_header_t &, attributes_id_t, std::vector<storage_location_t>, const dew_error_t &error)>>> _write_event_pipe;
+  vio::event_pipe_t<std::tuple<std::vector<attribute_write_t>, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &error)>>> _write_attributes_pipe;
   vio::event_pipe_t<std::tuple<std::vector<tree_id_t>, std::vector<serialized_tree_t>, std::function<void(std::vector<tree_id_t> &&, std::vector<storage_location_t> &&, dew_error_t &&error)>>> _write_trees_pipe;
   vio::event_pipe_t<serialized_tree_registry_t, std::function<void(storage_location_t, dew_error_t &&error)>> _write_tree_registry_pipe;
   vio::event_pipe_t<storage_location_t, std::vector<storage_location_t>, std::function<void(dew_error_t &&error)>> _write_blob_locations_and_update_header_pipe;

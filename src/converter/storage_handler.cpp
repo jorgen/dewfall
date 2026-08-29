@@ -52,6 +52,7 @@ storage_handler_t::storage_handler_t(const std::string &url, vio::thread_pool_t 
   , _index_written(index_written)
   , _storage_error(storage_error_pipe)
   , _write_event_pipe(_event_loop, vio::event_bind_t::bind(*this, &storage_handler_t::handle_write_events))
+  , _write_attributes_pipe(_event_loop, vio::event_bind_t::bind(*this, &storage_handler_t::handle_write_attributes))
   , _write_trees_pipe(_event_loop, vio::event_bind_t::bind(*this, &storage_handler_t::handle_write_trees))
   , _write_tree_registry_pipe(_event_loop, vio::event_bind_t::bind(*this, &storage_handler_t::handle_write_tree_registry))
   , _write_blob_locations_and_update_header_pipe(_event_loop, vio::event_bind_t::bind(*this, &storage_handler_t::handle_write_blob_locations_and_update_header))
@@ -381,6 +382,148 @@ void storage_handler_t::handle_write_events(
   {
     co_await self->do_write_events(std::move(header), std::move(attrib_id), std::move(buffers), std::move(done_cb));
   }(this, std::move(storage_header), std::move(attributes_id), std::move(attribute_buffers), std::move(done));
+}
+
+void storage_handler_t::write_attributes(std::vector<attribute_write_t> &&writes, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &error)> done)
+{
+  _write_attributes_pipe.post_event(std::make_tuple(std::move(writes), std::move(done)));
+}
+
+vio::task_t<void> storage_handler_t::do_write_attributes(std::vector<attribute_write_t> writes, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &)> done)
+{
+  auto write_start = std::chrono::steady_clock::now();
+  const int count = int(writes.size());
+  std::vector<storage_location_t> locations(writes.size());
+  dew_error_t error;
+
+  uint64_t uncompressed_total = 0;
+  uint64_t lod_bytes = 0;
+  for (auto &w : writes)
+  {
+    uncompressed_total += w.size;
+    if (w.is_lod)
+      lod_bytes += w.size;
+  }
+
+  if (_compressor)
+  {
+    auto *compressor = _compressor.get();
+    std::vector<std::function<std::expected<compressed_write_data_t, vio::error_t>()>> work_items;
+    work_items.reserve(size_t(count));
+    for (int i = 0; i < count; i++)
+    {
+      auto &w = writes[i];
+      work_items.push_back([compressor, data = w.data, size = w.size, format = w.format, point_count = w.point_count, i,
+                            attr_name = w.attribute_name, is_lod = w.is_lod]() -> std::expected<compressed_write_data_t, vio::error_t>
+      {
+        auto *raw = data.get();
+        // Unconditionally, unlike the whole-unit path's `if (i > 0)`: index 0 there is the position
+        // buffer, which carries the header and has no meaningful min/max. Every buffer here is an
+        // ordinary attribute.
+        double attr_min = std::numeric_limits<double>::max();
+        double attr_max = std::numeric_limits<double>::lowest();
+        compute_attribute_min_max(raw, size, format, attr_min, attr_max);
+
+        auto compressed = try_compress_constant(raw, size, format);
+        if (!compressed.data)
+          compressed = compressor->compress(raw, size, format, point_count);
+
+        compressed_write_data_t wd;
+        wd.buffer_index = i;
+        wd.attribute_name = attr_name;
+        wd.format = format;
+        wd.uncompressed_size = size;
+        wd.min_value = attr_min;
+        wd.max_value = attr_max;
+        wd.is_lod = is_lod;
+        if (compressed.error.code != 0)
+        {
+          // Compression failed: store the bytes verbatim. Same fallback the whole-unit path takes --
+          // a blob without the compression magic reads back as raw.
+          wd.data = data;
+          wd.size = size;
+        }
+        else
+        {
+          wd.data = std::move(compressed.data);
+          wd.size = compressed.size;
+        }
+        return wd;
+      });
+    }
+
+    auto results = co_await vio::schedule_work(_event_loop, _thread_pool, std::move(work_items));
+
+    for (auto &result : results)
+    {
+      if (!result.has_value())
+      {
+        error.code = result.error().code;
+        error.msg = result.error().msg;
+        continue;
+      }
+      auto &wd = result.value();
+
+      uint8_t compression_flags = 0;
+      if (wd.data && wd.size >= sizeof(compression_header_t) && has_compression_magic(wd.data.get(), wd.size))
+      {
+        compression_header_t hdr;
+        memcpy(&hdr, wd.data.get(), sizeof(hdr));
+        compression_flags = hdr.flags;
+      }
+      _compression_stats.accumulate(wd.attribute_name, wd.format, wd.uncompressed_size, wd.size, wd.min_value, wd.max_value, compression_flags, wd.is_lod);
+
+      auto &location = locations[size_t(wd.buffer_index)];
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _reader.backend()->allocate_blob(wd.size, storage_backend_t::blob_kind_t::data, location);
+      }
+      co_await do_write(wd.data, location);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < count; i++)
+    {
+      auto &w = writes[i];
+      _compression_stats.accumulate(w.attribute_name, w.format, w.size, w.size, std::numeric_limits<double>::max(), std::numeric_limits<double>::lowest(), 0, w.is_lod);
+      auto &location = locations[size_t(i)];
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _reader.backend()->allocate_blob(w.size, storage_backend_t::blob_kind_t::data, location);
+      }
+      co_await do_write(w.data, location);
+    }
+  }
+
+  // Same post-write housekeeping the whole-unit path does: an amend can add as many bytes as a
+  // conversion pass, so it has to be able to relieve cache pressure and request a checkpoint too.
+  _reader.backend()->maybe_evict();
+  if (_reader.backend()->wants_checkpoint() && _on_checkpoint_request && !_checkpoint_requested.exchange(true, std::memory_order_acq_rel))
+    _on_checkpoint_request();
+
+  auto write_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - write_start).count());
+  // Split by what the batch actually was rather than by a single flag: an amend covering a whole
+  // subtree writes leaf and LOD buffers in one call, and charging the lot to one counter would make
+  // both numbers wrong.
+  if (uncompressed_total > lod_bytes)
+    _perf_stats.source_write.record(uncompressed_total - lod_bytes, write_us);
+  if (lod_bytes)
+    _perf_stats.lod_write.record(lod_bytes, write_us);
+  if (_on_write_progress)
+    _on_write_progress();
+
+  if (done)
+    done(std::move(locations), error);
+}
+
+void storage_handler_t::handle_write_attributes(std::tuple<std::vector<attribute_write_t>, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &)>> &&event)
+{
+  auto &&[writes, done] = std::move(event);
+  [](storage_handler_t *self, std::vector<attribute_write_t> w, std::function<void(std::vector<storage_location_t> &&, const dew_error_t &)> done_cb) -> vio::detached_task_t
+  {
+    co_await self->do_write_attributes(std::move(w), std::move(done_cb));
+  }(this, std::move(writes), std::move(done));
 }
 
 vio::task_t<void> storage_handler_t::do_write_trees(std::vector<tree_id_t> tree_ids, std::vector<serialized_tree_t> serialized_trees,
