@@ -348,6 +348,16 @@ void processor_t::commit_attributes()
     return;
   }
 
+  // 0. Spill beside the dataset when it is a local path. The amend streams the caller's values to
+  //    disk rather than holding them, and the dataset's own directory is where the caller already
+  //    provisioned space for data of this size.
+  {
+    const auto slash = _url.find_last_of("/\\");
+    const bool looks_remote = _url.find("://") != std::string::npos;
+    if (!looks_remote && slash != std::string::npos)
+      _attribute_amend.set_spill_directory(_url.substr(0, slash));
+  }
+
   // 1. Land everything in flight. The amend snapshots each unit's storage locations and then writes
   //    against that snapshot; a conversion still placing blobs would be amending a moving dataset.
   wait_local_complete();

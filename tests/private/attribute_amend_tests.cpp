@@ -1914,3 +1914,172 @@ TEST_CASE("amend: an amended attribute survives a later LOD pass")
 
   std::remove(path);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 16. The K-pass merge: shuffled keys, duplicate keys, and a budget too small for one pass.
+
+namespace
+{
+// Sets an environment variable for the duration of a scope, restoring whatever was there.
+struct scoped_env_t
+{
+  std::string name;
+  std::string previous;
+  bool had_previous = false;
+
+  scoped_env_t(const char *variable, const char *value)
+    : name(variable)
+  {
+    if (const char *existing = std::getenv(variable))
+    {
+      previous = existing;
+      had_previous = true;
+    }
+    set(value);
+  }
+  ~scoped_env_t()
+  {
+    set(had_previous ? previous.c_str() : "");
+  }
+  void set(const char *value)
+  {
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value);
+#else
+    if (value && *value)
+      setenv(name.c_str(), value, 1);
+    else
+      unsetenv(name.c_str());
+#endif
+  }
+};
+} // namespace
+
+TEST_CASE("amend: the merge survives shuffled keys, duplicates and a one-unit budget")
+{
+  // Three things at once, because they interact and the interactions are where the bugs were.
+  //
+  //  * A BUDGET too small for a whole slice, so the commit runs many passes. Each pass re-reads the
+  //    value spill from the start -- which is how the first version deleted it after pass one.
+  //  * SHUFFLED keys, so `ascending` is false and the external sort actually runs, rather than the
+  //    free path a scan-ordered importer takes.
+  //  * DUPLICATE keys, where the LAST value added must win. That is the documented contract of
+  //    add_data, and with no sequence number stored it survives only because run formation is a
+  //    stable sort and the k-way merge breaks ties by run order.
+  constexpr const char *path = "attribute_amend_kpass.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  {
+    scoped_env_t budget("DEW_AMEND_BUDGET_BYTES", "4096"); // smaller than one unit: a pass per unit
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+    REQUIRE(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 1);
+
+    // Round one: every key gets a DELIBERATELY WRONG value.
+    std::vector<uint64_t> keys(k_amend_points);
+    std::vector<float> wrong(k_amend_points);
+    for (uint32_t k = 0; k < k_amend_points; k++)
+    {
+      keys[k] = k;
+      wrong[k] = -1.0f;
+    }
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data(), wrong.data(), k_amend_points) == 1);
+
+    // Round two: the same keys, SHUFFLED, with the right values. Every key is now a duplicate whose
+    // second occurrence must win, and the shuffle forces the external sort.
+    std::vector<uint32_t> order(k_amend_points);
+    for (uint32_t k = 0; k < k_amend_points; k++)
+      order[k] = k;
+    // A fixed shuffle -- deterministic, and no dependence on a particular library's generator.
+    for (uint32_t i = uint32_t(order.size()) - 1; i > 0; i--)
+    {
+      const uint32_t j = uint32_t((uint64_t(i) * 2654435761u + 12345u) % (i + 1));
+      std::swap(order[i], order[j]);
+    }
+    std::vector<uint64_t> shuffled_keys(k_amend_points);
+    std::vector<float> right(k_amend_points);
+    for (uint32_t i = 0; i < k_amend_points; i++)
+    {
+      shuffled_keys[i] = order[i];
+      right[i] = expected_value(order[i]);
+    }
+    // Delivered in several calls, as a streaming caller would.
+    const uint32_t chunk = k_amend_points / 7;
+    for (uint32_t offset = 0; offset < k_amend_points; offset += chunk)
+    {
+      const uint32_t n = std::min(chunk, k_amend_points - offset);
+      REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), shuffled_keys.data() + offset, right.data() + offset, n) == 1);
+    }
+
+    dew_converter_commit_attributes(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_finalize(converter);
+    dew_converter_destroy(converter);
+  }
+
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  const char *attributes[] = {k_key_name, k_amended_attribute};
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.attribute_names = attributes;
+  spec.attribute_count = 2;
+  spec.position_format = dew_position_r64_absolute;
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  REQUIRE(result.point_count == k_amend_points);
+
+  const dew_attribute_buffer_t *key_buffer = nullptr;
+  const dew_attribute_buffer_t *value_buffer = nullptr;
+  for (uint32_t i = 0; i < result.buffer_count; i++)
+  {
+    if (!result.buffers[i].name)
+      continue;
+    if (strcmp(result.buffers[i].name, k_key_name) == 0)
+      key_buffer = &result.buffers[i];
+    else if (strcmp(result.buffers[i].name, k_amended_attribute) == 0)
+      value_buffer = &result.buffers[i];
+  }
+  REQUIRE(key_buffer != nullptr);
+  REQUIRE(value_buffer != nullptr);
+  REQUIRE(value_buffer->size_bytes == result.point_count * sizeof(float));
+
+  const auto *keys = static_cast<const uint32_t *>(key_buffer->data);
+  const auto *values = static_cast<const float *>(value_buffer->data);
+  uint64_t correct = 0, stale = 0, zero = 0, wrong = 0;
+  for (uint64_t p = 0; p < result.point_count; p++)
+  {
+    if (keys[p] < k_amend_points && values[p] == expected_value(keys[p]))
+      correct++;
+    else if (values[p] == -1.0f)
+      stale++; // the first round's value won -- last-wins is broken
+    else if (values[p] == 0.0f)
+      zero++; // the merge missed this key entirely
+    else
+      wrong++;
+  }
+  MESSAGE("K-pass merge: ", correct, " correct, ", stale, " stale (duplicate resolved wrong), ", zero, " missed, ", wrong, " garbage");
+  CHECK(stale == 0);
+  CHECK(zero == 0);
+  CHECK(wrong == 0);
+  CHECK(correct == k_amend_points);
+
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  std::remove(path);
+}
