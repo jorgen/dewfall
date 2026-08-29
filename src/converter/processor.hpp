@@ -106,6 +106,8 @@ public:
   // Full quiesce: conversion pipeline idle AND (destination mode) the uploader drained/parked --
   // after this the dataset is durable at the destination (unless parked on errors).
   void wait_idle();
+  // End mutable mode: seal the dataset and, in destination mode, ship it. Blocks until done.
+  void finalize();
   // Conversion-only quiesce: the cache file is a complete valid DEW; uploads may still be running.
   void wait_local_complete();
   bool upload_active() const;

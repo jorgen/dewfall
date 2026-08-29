@@ -286,6 +286,26 @@ void processor_t::wait_local_complete()
   _idle_condition.wait(lock, [this] { return _idle; });
 }
 
+void processor_t::finalize()
+{
+  // 1. Land whatever is in flight BEFORE arming the seal. Flipping a tree to final while its LOD
+  //    writes are still queued trips "LOD write into finalized tree" in the generator.
+  wait_local_complete();
+
+  // 2. Arm sealing, and wait for the tree loop to actually have the flag (see clear_mutable_and_wait).
+  _tree_handler.clear_mutable_and_wait();
+
+  // 3. Force the checkpoint that does the sealing, and wait for the CHAIN -- not for idle.
+  //    wait_local_complete cannot serve here: _idle is already latched by step 1, so it would return
+  //    immediately and steps 4-5 would run against an unsealed dataset. checkpoint_and_wait blocks on
+  //    the serialize chain finishing, which is the event that actually flips the trees.
+  _tree_handler.checkpoint_and_wait();
+
+  // 4. Bands, uploads, and the destination-mode quiesce checkpoints. Now that trees are final,
+  //    emit_band_job has something to ship and is no longer suppressed.
+  wait_idle();
+}
+
 void processor_t::wait_idle()
 {
   // Full quiesce: conversion done (cache is a complete valid DEW), then every committed

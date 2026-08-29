@@ -1078,3 +1078,92 @@ TEST_CASE("mutable: two sessions produce the same dataset as one")
   std::remove(one_path);
   std::remove(two_path);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 11. Ending mutable mode.
+
+namespace
+{
+
+// Reopen a mutable dataset purely to finalize it -- no new input.
+bool finalize_dataset(const char *path)
+{
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+  if (!converter)
+  {
+    if (error)
+      dew_error_destroy(error);
+    return false;
+  }
+  dew_converter_finalize(converter);
+  const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
+  dew_converter_destroy(converter);
+  return ok;
+}
+
+bool reopened_is_mutable(const char *path)
+{
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+  REQUIRE(converter != nullptr);
+  const bool m = dew_converter_is_mutable(converter) != 0;
+  dew_converter_destroy(converter);
+  return m;
+}
+
+} // namespace
+
+TEST_CASE("mutable: finalize seals the dataset and the seal survives a reopen")
+{
+  constexpr const char *path = "attribute_amend_finalize.dew";
+  std::remove(path);
+
+  REQUIRE(add_one_input_mutable(path, k_coloured_name, dew_open_file_semantics_truncate));
+  REQUIRE(add_one_input_mutable(path, k_plain_name, dew_open_file_semantics_open_existing));
+  REQUIRE(reopened_is_mutable(path));
+
+  REQUIRE(finalize_dataset(path));
+
+  // The flag is cleared AND persisted -- a dataset that reported itself sealed but came back mutable
+  // would silently keep deferring uploads forever.
+  CHECK(!reopened_is_mutable(path));
+
+  // And finalizing changed nothing about the data.
+  MESSAGE("after finalize: ", query_point_count(path), " points");
+  CHECK(query_point_count(path) == 2 * k_amend_points);
+
+  std::remove(path);
+}
+
+TEST_CASE("mutable: a finalized dataset matches one converted in a single pass")
+{
+  // The end-to-end promise of the whole mode: build it however you like -- one session or several,
+  // mutable throughout -- and after finalize it is indistinguishable from an ordinary conversion.
+  constexpr const char *one_path = "attribute_amend_fin_one.dew";
+  constexpr const char *many_path = "attribute_amend_fin_many.dew";
+  std::remove(one_path);
+  std::remove(many_path);
+
+  REQUIRE(build_mixed_dataset_tuned(one_path, 700, 0));
+  REQUIRE(add_one_input_mutable(many_path, k_coloured_name, dew_open_file_semantics_truncate));
+  REQUIRE(add_one_input_mutable(many_path, k_plain_name, dew_open_file_semantics_open_existing));
+  REQUIRE(finalize_dataset(many_path));
+
+  for (int32_t lod = 0; lod <= 4; lod++)
+  {
+    const auto a = census_at(one_path, lod == 0 ? dew_lod_full : dew_lod_level, lod);
+    const auto b = census_at(many_path, lod == 0 ? dew_lod_full : dew_lod_level, lod);
+    MESSAGE("lod ", lod, ": single=[pts ", a.points, " nodes ", a.nodes, " col ", a.coloured, " blank ", a.blank, "]  finalized=[pts ", b.points, " nodes ", b.nodes, " col ", b.coloured,
+            " blank ", b.blank, "]");
+    CHECK(a.points == b.points);
+    CHECK(a.nodes == b.nodes);
+    CHECK(a.coloured == b.coloured);
+    CHECK(a.blank == b.blank);
+    CHECK(a.garbage == 0);
+    CHECK(b.garbage == 0);
+  }
+
+  std::remove(one_path);
+  std::remove(many_path);
+}

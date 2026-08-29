@@ -181,6 +181,21 @@ void tree_handler_t::request_root()
 #endif
 }
 
+void tree_handler_t::clear_mutable_and_wait()
+{
+  // Ordering matters, which is why this waits rather than posting like set_mutable does. finalize
+  // clears the flag and then forces a checkpoint; if the clear were merely queued, the checkpoint
+  // could run first, find the dataset still mutable, seal nothing, and report success.
+  {
+    std::unique_lock<std::mutex> lock(_configuration_mutex);
+    _pre_init_tree_config.mutable_dataset = 0;
+  }
+  // Bounded (loop_quiesce.hpp): on timeout write it directly, which is the pre-barrier race rather
+  // than a finalize that never returns.
+  if (!core::run_on_loop_and_wait(_event_loop, [this]() { _tree_registry.tree_config.mutable_dataset = 0; }))
+    _tree_registry.tree_config.mutable_dataset = 0;
+}
+
 void tree_handler_t::lower_lod_floor(const morton::morton192_t &floor)
 {
   // Re-open the LOD pyramid from `floor` upward so a newly added input is covered.

@@ -252,6 +252,11 @@ uint8_t dew_converter_is_mutable(dew_converter_t *converter)
   return converter->processor.is_mutable() ? 1 : 0;
 }
 
+void dew_converter_finalize(dew_converter_t *converter)
+{
+  converter->processor.finalize();
+}
+
 void dew_converter_set_compression_level(dew_converter_t *converter, int level)
 {
   converter->processor.storage_handler().set_compression_level(level);

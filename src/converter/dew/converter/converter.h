@@ -296,6 +296,17 @@ DEW_CONVERTER_EXPORT void dew_converter_set_mutable(struct dew_converter_t *conv
 /* 1 while the dataset is mutable (including one reopened in that state). */
 DEW_CONVERTER_EXPORT uint8_t dew_converter_is_mutable(struct dew_converter_t *converter);
 
+/* End mutable mode: seal the dataset, and in destination mode ship it.
+ *
+ * Blocks until everything in flight has landed, every eligible tree has been marked final, and the
+ * upload backlog has drained. After this the dataset is exactly what an ordinary conversion
+ * produces, and it will no longer accept new input -- a later add_data_file routes points into
+ * finalized trees, which is a hard error.
+ *
+ * Idempotent-ish: calling it on a dataset that is not mutable simply drains, like wait_idle. */
+//= blocking
+DEW_CONVERTER_EXPORT void dew_converter_finalize(struct dew_converter_t *converter);
+
 // Read/sort chunk byte target (default 64 MiB): the converter ingests each input in chunks of about
 // this many bytes (computed from the file's per-point width, never below the node point limit,
 // capped at 8M points per chunk). Larger chunks amortize source reads and sorting; the octree still

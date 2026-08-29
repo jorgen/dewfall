@@ -82,6 +82,9 @@ public:
   // Posted to the tree loop, which owns _tree_registry; the next checkpoint persists it.
   void set_mutable(bool value);
   [[nodiscard]] bool is_mutable();
+  // Clear the mutable flag and WAIT for the tree loop to have it. finalize forces a checkpoint
+  // straight after; a merely-queued clear could lose that race and seal nothing.
+  void clear_mutable_and_wait();
   void about_to_block() override;
   // Thread-safe: posts to the tree loop. The pass target/generator state belong to the tree loop,
   // which may be mid-checkpoint (serialize chain, band emission) when the processor advances the
