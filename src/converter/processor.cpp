@@ -142,7 +142,13 @@ processor_t::processor_t(std::string url, file_existence_requirement_t existence
       _lod_done_morton = _tree_handler.tree_registry().lod_watermark;
       _current_lod_target_morton = _lod_done_morton;
     }
-    _tree_handler.request_root();
+    // A MUTABLE dataset can take new points, and the insert path assumes every tree it descends
+    // into is resident -- true during a fresh conversion, false after a reopen, where data[] is a
+    // vector of null pointers filled in lazily. Pull them all in before any input arrives.
+    if (_tree_handler.is_mutable())
+      _tree_handler.request_all_trees();
+    else
+      _tree_handler.request_root();
   }
 
 #ifndef __EMSCRIPTEN__

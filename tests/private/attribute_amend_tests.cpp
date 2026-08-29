@@ -936,18 +936,26 @@ TEST_CASE("mutable: the mode survives closing and reopening the dataset")
 
 TEST_CASE("mutable: a second session can add a new input to an existing dataset" * doctest::skip())
 {
-  // SKIPPED: this is the target for the next piece of work, not a regression.
+  // SKIPPED: one piece still missing, and it is NOT the seal.
   //
-  // The mode itself works -- the flag persists (test above), trees stay `building`, and no band is
-  // emitted. What is still missing is one level down: the insert path assumes every tree is
-  // RESIDENT. On reopen tree_registry.data is resized to N null pointers and trees are loaded
-  // lazily, but sub_tree_insert_points -> move_storage_locations_to_subtree dereferences a sub-tree
-  // unconditionally and segfaults on the null. During a fresh conversion every tree was created in
-  // the same session, so this never showed.
+  // The sequence that aborts without mutable mode (test 8 records the abort): two inputs, two
+  // separate converter sessions, the dataset closed in between. Two of the three halves are in --
+  // the deferred seal, and every tree pulled in on open (the insert path dereferences a sub-tree
+  // without checking it is resident, which is fine in a fresh conversion and a segfault after a
+  // reopen).
   //
-  // Fixing it means either loading every tree when a mutable dataset is opened, or making the
-  // insert path request-and-retry the way the renderer already does (tree_handler request_trees).
-  // Un-skip when that lands.
+  // What is left is that the second session's points reach the tree and are then THROWN AWAY.
+  // Traced with DEW_DEBUG_CHAIN=1:
+  //     [sched] sub_added file=1 / reading_done file=1 / tree_done file=1
+  //     [sched] maybe_start_lod generating=false done_morton=<terminal> lod_done=<terminal>
+  //     ... and nothing further -- no handle_generate_lod, no index_write_done.
+  // The checkpoint that persists a session is driven by a LOD pass concluding, and maybe_start_lod
+  // gates on done_morton > _lod_done_morton (processor.cpp). Both sit at the all-0xFF terminal on a
+  // reopened dataset, so no pass fires, so no checkpoint is written. The points exist only in memory
+  // and die with the converter -- which is why this returns 8000 rather than 16000.
+  //
+  // Needs a forced pass on reopen (lower tree_lod_generator's _lod_complete_morton and bypass the
+  // maybe_start_lod gate). Un-skip when that lands.
   // THE POINT OF THE WHOLE MODE, and the exact sequence that aborts without it (test 8 records the
   // abort). Two inputs, two separate converter sessions, the dataset closed in between.
   constexpr const char *path = "attribute_amend_mutable_grow.dew";

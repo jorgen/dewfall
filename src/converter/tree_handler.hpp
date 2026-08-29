@@ -54,6 +54,14 @@ public:
   void stop_loop();
   [[nodiscard]] dew_error_t deserialize_tree_registry(std::unique_ptr<uint8_t[]> &tree_registry_buffer, uint32_t tree_registry_blobs_size);
   void request_root();
+  // Load EVERY tree that has stored data, and block until they are all resident.
+  //
+  // The insert path assumes residency: sub_tree_insert_points descends into a sub-tree and
+  // dereferences tree_registry.data[id] without checking, which is safe during a fresh conversion
+  // because every tree was created in that session. A reopened dataset resizes data[] to null
+  // pointers and loads lazily, so a mutable dataset -- the only one that takes new points after a
+  // reopen -- has to pull them all in first. Called once, at open.
+  void request_all_trees();
   void set_tree_initialization_config(const tree_config_t &config);
   void set_tree_initialization_scale(double scale);
   // Read the pre-init config WITHOUT sealing it (for consumers that only need provisional values

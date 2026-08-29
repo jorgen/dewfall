@@ -181,6 +181,47 @@ void tree_handler_t::request_root()
 #endif
 }
 
+void tree_handler_t::request_all_trees()
+{
+  // Everything that has stored data. A zero-size location is a tree slot that was never written.
+  std::vector<tree_id_t> ids;
+  ids.reserve(_tree_registry.locations.size());
+  for (uint32_t i = 0; i < uint32_t(_tree_registry.locations.size()); i++)
+    if (_tree_registry.locations[i].size != 0)
+      ids.push_back(tree_id_t(i));
+  if (ids.empty())
+    return;
+  const size_t wanted = ids.size();
+  request_trees_async(std::move(ids));
+
+  // Wait for residency the same way request_root does. tree_id_initialized is published with a
+  // release store from the tree loop (handle_deserialize_tree), so an acquire load here sees a fully
+  // constructed tree. Poll rather than add a second condition variable: this runs once, at open,
+  // before any conversion work exists to contend with.
+  const auto resident = [this, wanted]() {
+    size_t n = 0;
+    for (uint32_t i = 0; i < uint32_t(_tree_registry.locations.size()); i++)
+    {
+      if (_tree_registry.locations[i].size == 0)
+        continue;
+      if (i < _tree_registry.tree_id_initialized.size() && std::atomic_ref<const uint8_t>(_tree_registry.tree_id_initialized[i]).load(std::memory_order_acquire))
+        n++;
+    }
+    return n >= wanted;
+  };
+#ifdef __EMSCRIPTEN__
+  // Cooperative single thread: nothing else will drain the loop while we block, so pump it.
+  while (!resident())
+  {
+    vio::wasm::pump();
+    emscripten_sleep(0);
+  }
+#else
+  while (!resident())
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
+}
+
 void tree_handler_t::set_tree_initialization_config(const tree_config_t &config)
 {
   std::unique_lock<std::mutex> lock(_configuration_mutex);
@@ -715,10 +756,14 @@ void tree_handler_t::handle_deserialize_tree(tree_id_t &&tree_id, serialized_tre
   dew_error_t error;
   auto ret = tree_deserialize(data, *tree, error);
   if (ret)
+  {
+    // Both transients are recomputed on load rather than serialized: leaves_collapsed is derived
+    // from the leaf shape, and mins is a debug-only shadow of each node's minimum morton.
     tree_compute_leaves_collapsed(*tree, _tree_registry);
-    #ifndef NDEBUG
-    tree_compute_mins(*tree); // debug-only shadow, never serialized -- see tree.hpp
-    #endif
+#ifndef NDEBUG
+    tree_compute_mins(*tree);
+#endif
+  }
   if (!ret)
   {
     fmt::print("Error deserializing tree registry {}\n", error.msg);
