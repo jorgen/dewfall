@@ -7,6 +7,7 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 # complete enough to drive from outside, which is what the Python half will then do.
 add_executable(ford_import
         ford_import.cpp
+        ford_colour.cpp
         ford_convert.cpp
         mat_v5.cpp
         ppm.cpp

@@ -353,7 +353,15 @@ void tree_handler_t::set_mutable(bool value)
   }
   // _tree_registry belongs to the tree loop, which may be mid-checkpoint. Post rather than write
   // across threads -- same discipline as generate_lod.
-  _event_loop.run_in_loop([this, value]() { _tree_registry.tree_config.mutable_dataset = value ? 1 : 0; });
+  //
+  // And WAIT for it, symmetrically with clear_mutable_and_wait. On a REOPENED dataset the
+  // configuration is already sealed, so is_mutable() reads the registry's copy -- the one this
+  // lambda writes. Merely posting means set_mutable(true) followed immediately by
+  // dew_converter_add_attribute still sees the old value and the amend is refused for a dataset the
+  // caller just made mutable. Bounded (loop_quiesce.hpp) with a direct write on timeout, which is
+  // the pre-barrier race rather than a setter that can hang.
+  if (!core::run_on_loop_and_wait(_event_loop, [this, value]() { _tree_registry.tree_config.mutable_dataset = value ? 1 : 0; }))
+    _tree_registry.tree_config.mutable_dataset = value ? 1 : 0;
 }
 
 bool tree_handler_t::is_mutable()

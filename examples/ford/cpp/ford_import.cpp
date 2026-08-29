@@ -27,7 +27,9 @@
 #include <fmt/format.h>
 
 #include <dew/converter/converter.h>
+#include <dew/core/default_attribute_names.h>
 
+#include "ford_colour.hpp"
 #include "ford_convert.hpp"
 #include "ford_dataset.hpp"
 #include "ppm.hpp"
@@ -65,7 +67,8 @@ int usage()
   fmt::print(stderr,
              "usage:\n"
              "  ford_import inspect <dataset-root> [--scan N]\n"
-             "  ford_import convert <dataset-root> <output.dew> [--scans N] [--scale M] [--stride N]\n");
+             "  ford_import convert <dataset-root> <output.dew> [--scans N] [--scale M] [--stride N] [--finalize]\n"
+             "  ford_import colour  <dataset-root> <dataset.dew> [--scans N]\n");
   return 2;
 }
 
@@ -178,7 +181,7 @@ int inspect(const std::string &root, int scan_ordinal)
 }
 
 
-int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride)
+int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride, bool finalize)
 {
   std::string error;
   ford::dataset_t dataset;
@@ -285,7 +288,10 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
   // perfectly good -- so only an import that produced nothing is fatal. The Ford release ships at
   // least one truncated scan, and refusing the other 3816 over it would be absurd.
   const bool failed = scans_done == 0;
-  if (!failed)
+  // NOT finalized by default. finalize is what ENDS a dataset's amendable life -- it seals the trees
+  // so they can be banded and evicted, and an amend has to read every unit it touches. Pass 2 is
+  // what seals this dataset; --finalize is for an import that is not going to be amended.
+  if (!failed && finalize)
     dew_converter_finalize(converter);
 
   dew_converter_stats_t stats{};
@@ -312,6 +318,81 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
   fmt::print("\ninspect it with:  dew info {}\n", output);
   return 0;
 }
+
+int colour(const std::string &root, const std::string &dataset_path, int scan_limit)
+{
+  std::string error;
+  ford::dataset_t dataset;
+  if (!ford::dataset_open(root, dataset, error))
+  {
+    fmt::print(stderr, "error: {}\n", error);
+    return 1;
+  }
+
+  dew_error_t *create_error = nullptr;
+  auto *converter = dew_converter_create(dataset_path.c_str(), dataset_path.size(), dew_open_file_semantics_open_existing, &create_error);
+  if (!converter)
+  {
+    int code = 0;
+    const char *message = nullptr;
+    size_t length = 0;
+    if (create_error)
+      dew_error_get_info(create_error, &code, &message, &length);
+    fmt::print(stderr, "error: cannot open {}: {}\n", dataset_path, std::string(message ? message : "", length));
+    return 1;
+  }
+
+  // Amending requires a MUTABLE dataset: a finalized one has trees that have been banded and, in
+  // destination mode, evicted, and an amend has to read every unit it touches. Pass 1 left it
+  // mutable; saying so again is what a fresh process has to do after reopening.
+  dew_converter_set_mutable(converter, 1);
+  dew_converter_runtime_callbacks_t runtime{};
+  runtime.warning = on_warning;
+  runtime.error = on_error;
+  dew_converter_set_runtime_callbacks(converter, runtime, nullptr);
+
+  if (dew_converter_add_attribute(converter, DEW_ATTRIBUTE_RGB, uint32_t(strlen(DEW_ATTRIBUTE_RGB)), ford::k_key_attribute, uint32_t(strlen(ford::k_key_attribute)), dew_type_u8,
+                                  dew_components_3) == 0)
+  {
+    fmt::print(stderr, "error: could not declare {} on {}\n", DEW_ATTRIBUTE_RGB, dataset_path);
+    dew_converter_destroy(converter);
+    return 1;
+  }
+
+  fmt::print("{}\n  sampling colour for {}\n", root, dataset_path);
+  ford::colour_stats_t stats;
+  const auto started = std::chrono::steady_clock::now();
+  if (!ford::ford_colour_scans(dataset, converter, size_t(scan_limit > 0 ? scan_limit : 0), stats, error))
+  {
+    fmt::print(stderr, "error: {}\n", error);
+    dew_converter_destroy(converter);
+    return 1;
+  }
+  const double sample_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+  fmt::print("  {} scans read ({} unreadable, {} without a matching image), {} images\n", stats.scans_read, stats.scans_failed, stats.scans_without_image, stats.images_loaded);
+  fmt::print("  {} of {} points coloured ({:.1f}%), {} pixels out of range\n", stats.points_coloured, stats.points_seen, stats.points_seen ? 100.0 * double(stats.points_coloured) / double(stats.points_seen) : 0.0,
+             stats.pixels_out_of_range);
+  fmt::print("  sampled in {:.1f}s\n", sample_s);
+
+  // THE pass. One read and one write of one attribute per unit -- the unit's existing blobs are not
+  // read, not recompressed and not moved.
+  fmt::print("\ncommitting {} to every node ...\n", DEW_ATTRIBUTE_RGB);
+  const auto commit_started = std::chrono::steady_clock::now();
+  dew_converter_commit_attributes(converter);
+  const double commit_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - commit_started).count();
+  const bool failed = dew_converter_status(converter) == dew_conversion_status_error;
+  if (!failed)
+    dew_converter_finalize(converter);
+  dew_converter_destroy(converter);
+  if (failed)
+  {
+    fmt::print(stderr, "error: the amend failed\n");
+    return 1;
+  }
+  fmt::print("  committed in {:.1f}s\n\ninspect it with:  dew info {}\n", commit_s, dataset_path);
+  return 0;
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -327,9 +408,10 @@ int main(int argc, char **argv)
   int scan_limit = 0;
   int stride = 32;
   double scale = 0.001;
+  bool finalize = false;
   std::string output;
   int first_option = 3;
-  if (command == "convert")
+  if (command == "convert" || command == "colour")
   {
     if (argc < 4)
       return usage();
@@ -346,6 +428,8 @@ int main(int argc, char **argv)
       stride = atoi(argv[++i]);
     else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
       scale = atof(argv[++i]);
+    else if (strcmp(argv[i], "--finalize") == 0)
+      finalize = true;
     else
       return usage();
   }
@@ -355,7 +439,13 @@ int main(int argc, char **argv)
   {
     if (output.empty())
       return usage();
-    return convert(root, output, scan_limit, scale, stride);
+    return convert(root, output, scan_limit, scale, stride, finalize);
+  }
+  if (command == "colour")
+  {
+    if (output.empty())
+      return usage();
+    return colour(root, output, scan_limit);
   }
   return usage();
 }
