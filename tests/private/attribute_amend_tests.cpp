@@ -794,3 +794,74 @@ TEST_CASE("amend: reopening a finished dataset re-adds its inputs without duplic
 
   std::remove(path);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 8. How the inputs may be handed to ONE converter session.
+
+// Finalization tracks the done-morton watermark, not the end of the run: a tree is sealed as soon as
+// the watermark proves no more points can land in its range (tree_handler.cpp, gated on
+// leaves_collapsed). So WHEN a file is added matters spatially, not just temporally -- an input
+// whose points fall in a range the watermark has already swept past has nowhere to go.
+//
+// That is a real constraint on an ingest loop over thousands of scans, so it is measured here rather
+// than reasoned about. Both inputs interleave (even/odd x), which is the worst case: every tree
+// covers both, so a late arrival always targets ground the early one already claimed.
+
+namespace
+{
+
+// Add each name in its own dew_converter_add_data_file call, optionally draining between them.
+bool build_in_batches(const char *path, const std::vector<const char *> &names, bool drain_between)
+{
+  std::remove(path);
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_truncate, &error);
+  if (!converter)
+  {
+    if (error)
+      dew_error_destroy(error);
+    return false;
+  }
+  dew_converter_file_convert_callbacks_t callbacks{};
+  callbacks.pre_init = amend_pre_init;
+  callbacks.init = amend_init;
+  callbacks.convert_data = amend_convert_data;
+  callbacks.destroy_user_ptr = amend_destroy_user_ptr;
+  dew_converter_set_file_converter_callbacks(converter, callbacks);
+  dew_converter_set_node_point_limit(converter, 700);
+
+  for (const char *name : names)
+  {
+    dew_converter_str_buffer buf{name, uint32_t(strlen(name))};
+    dew_converter_add_data_file(converter, &buf, 1);
+    if (drain_between)
+      dew_converter_wait_idle(converter);
+  }
+  dew_converter_wait_idle(converter);
+  const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
+  dew_converter_destroy(converter);
+  return ok;
+}
+
+} // namespace
+
+TEST_CASE("amend: several add_data_file calls in one session are safe without draining")
+{
+  // The pattern an ingest loop over 3817 scans would naturally use: batch them, hand each batch over
+  // as it is discovered, never drain until the end. The files stay in flight together, so the
+  // watermark cannot run ahead of an input that has been registered but not yet read.
+  constexpr const char *path = "attribute_amend_batches.dew";
+  REQUIRE(build_in_batches(path, {k_coloured_name, k_plain_name}, /*drain_between=*/false));
+
+  const uint64_t points = query_point_count(path);
+  MESSAGE("two separate add_data_file calls, no drain between: ", points, " points");
+  REQUIRE(points == 2 * k_amend_points);
+
+  // The NEGATIVE half, measured but not asserted here because it aborts the process rather than
+  // failing: the same two calls with a dew_converter_wait_idle between them dies on
+  // tree_build.cpp's "point insert into finalized tree". Draining runs the terminal pass, which
+  // seals every tree; the second input then has nowhere to go. So the rule for an ingest loop is
+  // "add as many batches as you like, drain exactly once at the end".
+
+  std::remove(path);
+}
