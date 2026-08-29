@@ -145,6 +145,25 @@ dew_error_t tree_handler_t::deserialize_tree_registry(std::unique_ptr<uint8_t[]>
   {
     _initialized = true;
     _configuration_initialized = true;
+    // A MUTABLE dataset reopens as a conversion still IN PROGRESS: every LOD watermark goes back to
+    // zero rather than being restored.
+    //
+    // Restoring them is what makes a second session silently lose its input. The persisted watermark
+    // on a dataset whose inputs all finished is the all-0xFF terminal, so done_morton == lod_done and
+    // maybe_start_lod's `done_morton > _lod_done_morton` gate never fires. No pass runs -- and the
+    // checkpoint that persists a session IS a pass concluding, so the new points reach the tree
+    // (traced: sub_added / reading_done / tree_done) and are then thrown away with the converter.
+    //
+    // Zeroing them costs a full re-LOD on the next pass, which is correct but not cheap: the floor
+    // could instead be lowered only to the minimum morton of the newly added inputs. That is an
+    // optimisation to make once there is something to measure it against -- and it is only safe
+    // because the pass TARGET stays terminal; a sub-terminal target drops nodes without handing them
+    // to their parent, which loses coverage rather than costing time.
+    //
+    // Safe here specifically because mutable suppresses both consumers of the watermark: the finality
+    // flip and emit_band_job. finalize() re-advances it to terminal before either is re-enabled.
+    if (_tree_registry.tree_config.mutable_dataset)
+      _tree_registry.lod_watermark = {};
     // Resume: seed the finality/LOD watermarks from the persisted registry (v2; zero for v1 files
     // -- morton192 is a min-accumulating compare, an all-zero watermark restores nothing).
     morton::morton192_t zero = {};

@@ -934,28 +934,14 @@ TEST_CASE("mutable: the mode survives closing and reopening the dataset")
   std::remove(path);
 }
 
-TEST_CASE("mutable: a second session can add a new input to an existing dataset" * doctest::skip())
+TEST_CASE("mutable: a second session can add a new input to an existing dataset")
 {
-  // SKIPPED: one piece still missing, and it is NOT the seal.
-  //
-  // The sequence that aborts without mutable mode (test 8 records the abort): two inputs, two
-  // separate converter sessions, the dataset closed in between. Two of the three halves are in --
-  // the deferred seal, and every tree pulled in on open (the insert path dereferences a sub-tree
-  // without checking it is resident, which is fine in a fresh conversion and a segfault after a
-  // reopen).
-  //
-  // What is left is that the second session's points reach the tree and are then THROWN AWAY.
-  // Traced with DEW_DEBUG_CHAIN=1:
-  //     [sched] sub_added file=1 / reading_done file=1 / tree_done file=1
-  //     [sched] maybe_start_lod generating=false done_morton=<terminal> lod_done=<terminal>
-  //     ... and nothing further -- no handle_generate_lod, no index_write_done.
-  // The checkpoint that persists a session is driven by a LOD pass concluding, and maybe_start_lod
-  // gates on done_morton > _lod_done_morton (processor.cpp). Both sit at the all-0xFF terminal on a
-  // reopened dataset, so no pass fires, so no checkpoint is written. The points exist only in memory
-  // and die with the converter -- which is why this returns 8000 rather than 16000.
-  //
-  // Needs a forced pass on reopen (lower tree_lod_generator's _lod_complete_morton and bypass the
-  // maybe_start_lod gate). Un-skip when that lands.
+  // The sequence that aborts without mutable mode (test 8 records that abort). Three pieces have to
+  // be in place, and each failed differently while they were not:
+  //   * the deferred seal -- otherwise the second insert aborts on "point insert into finalized tree";
+  //   * every tree resident on open -- otherwise the insert path segfaults on a lazily-loaded null;
+  //   * the LOD watermarks reset on reopen -- otherwise no pass fires, so no checkpoint is written,
+  //     and the second session's points reach the tree and are discarded (it returned 8000, not 16000).
   // THE POINT OF THE WHOLE MODE, and the exact sequence that aborts without it (test 8 records the
   // abort). Two inputs, two separate converter sessions, the dataset closed in between.
   constexpr const char *path = "attribute_amend_mutable_grow.dew";
@@ -975,6 +961,12 @@ TEST_CASE("mutable: a second session can add a new input to an existing dataset"
   // Re-adding an input that already landed is still skipped, so a restarted ingest converges.
   REQUIRE(add_one_input_mutable(path, k_coloured_name, dew_open_file_semantics_open_existing));
   REQUIRE(query_point_count(path) == 2 * k_amend_points);
+
+  // And the second session reached the LOD PYRAMID, not merely full resolution -- which is the
+  // whole reason the watermark reset exists. A coarse frontier has to contain points from both
+  // sessions: the first input is coloured, the second is not, so seeing BOTH at a coarse level is
+  // proof the re-LOD covered the newly added input rather than just the one already there.
+  require_colours_are_clean(path, dew_lod_level, 3, "two mutable sessions, lod level 3");
 
   std::remove(path);
 }
