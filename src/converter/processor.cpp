@@ -496,6 +496,39 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
       settled.push_back(r.pre_init_result.id);
     }
   }
+  // A MUTABLE dataset may already have been LOD-ed all the way to the terminal watermark, which
+  // leaves maybe_start_lod's gate permanently shut. Re-open the pyramid from the lowest morton this
+  // batch introduces, so the new input -- and every ancestor above it -- is regenerated, while the
+  // rest of the tree is left alone. input_order is the morton of the pre-init aabb-min corner and is
+  // zero when the source could not report one, which degrades to re-LOD-ing everything: correct, and
+  // the only safe answer when the new points could be anywhere.
+  if (_tree_handler.is_mutable())
+  {
+    bool have_floor = false;
+    morton::morton192_t floor{};
+    for (auto &result : results)
+    {
+      if (!result.has_value() || result.value().has_error)
+        continue;
+      const auto &pre = result.value().pre_init_result;
+      morton::morton192_t candidate{};
+      if (pre.found_min)
+        convert_pos_to_morton(_tree_handler.tree_config().scale, _tree_handler.tree_config().offset, pre.min, candidate);
+      if (!have_floor || candidate < floor)
+      {
+        floor = candidate;
+        have_floor = true;
+      }
+    }
+    if (have_floor)
+    {
+      _tree_handler.lower_lod_floor(floor);
+      // The processor's own gate has to come down with it, or maybe_start_lod still refuses.
+      if (floor < _lod_done_morton)
+        _lod_done_morton = floor;
+    }
+  }
+
   // Every input registered in this batch has to SETTLE, one way or the other: an unsettled one is
   // neither dispatchable (next_input_to_process skips it) nor retired, so all_inserted_into_tree()
   // never turns true and wait_idle() blocks for good. schedule_work may answer with an unexpected,

@@ -62,6 +62,9 @@ public:
   // pointers and loads lazily, so a mutable dataset -- the only one that takes new points after a
   // reopen -- has to pull them all in first. Called once, at open.
   void request_all_trees();
+  // Re-open the LOD pyramid from `floor` upward, so an input added to an already-LOD-ed dataset is
+  // covered. Only the floor moves; the pass target stays terminal. See the definition.
+  void lower_lod_floor(const morton::morton192_t &floor);
   void set_tree_initialization_config(const tree_config_t &config);
   void set_tree_initialization_scale(double scale);
   // Read the pre-init config WITHOUT sealing it (for consumers that only need provisional values

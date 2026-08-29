@@ -145,25 +145,6 @@ dew_error_t tree_handler_t::deserialize_tree_registry(std::unique_ptr<uint8_t[]>
   {
     _initialized = true;
     _configuration_initialized = true;
-    // A MUTABLE dataset reopens as a conversion still IN PROGRESS: every LOD watermark goes back to
-    // zero rather than being restored.
-    //
-    // Restoring them is what makes a second session silently lose its input. The persisted watermark
-    // on a dataset whose inputs all finished is the all-0xFF terminal, so done_morton == lod_done and
-    // maybe_start_lod's `done_morton > _lod_done_morton` gate never fires. No pass runs -- and the
-    // checkpoint that persists a session IS a pass concluding, so the new points reach the tree
-    // (traced: sub_added / reading_done / tree_done) and are then thrown away with the converter.
-    //
-    // Zeroing them costs a full re-LOD on the next pass, which is correct but not cheap: the floor
-    // could instead be lowered only to the minimum morton of the newly added inputs. That is an
-    // optimisation to make once there is something to measure it against -- and it is only safe
-    // because the pass TARGET stays terminal; a sub-terminal target drops nodes without handing them
-    // to their parent, which loses coverage rather than costing time.
-    //
-    // Safe here specifically because mutable suppresses both consumers of the watermark: the finality
-    // flip and emit_band_job. finalize() re-advances it to terminal before either is re-enabled.
-    if (_tree_registry.tree_config.mutable_dataset)
-      _tree_registry.lod_watermark = {};
     // Resume: seed the finality/LOD watermarks from the persisted registry (v2; zero for v1 files
     // -- morton192 is a min-accumulating compare, an all-zero watermark restores nothing).
     morton::morton192_t zero = {};
@@ -198,6 +179,35 @@ void tree_handler_t::request_root()
   std::unique_lock<std::mutex> lock(_root_mutex);
   _root_cv.wait(lock, [this] { return _first_root_initialized; });
 #endif
+}
+
+void tree_handler_t::lower_lod_floor(const morton::morton192_t &floor)
+{
+  // Re-open the LOD pyramid from `floor` upward so a newly added input is covered.
+  //
+  // On a dataset whose inputs all finished, every watermark sits at the all-0xFF terminal. Left
+  // there, maybe_start_lod's `done_morton > _lod_done_morton` gate never fires -- and since the
+  // checkpoint that persists a session IS a pass concluding, the new points reach the tree and are
+  // then discarded. Lowering re-arms the ordinary machinery; no bespoke pass is needed.
+  //
+  // Only the FLOOR moves. The pass TARGET stays terminal, which is what makes this safe: a
+  // sub-terminal target drops a node without handing it to its parent (tree_lod_generator's first
+  // skip returns before the parent collects the child), so the parent would regenerate with LESS
+  // coverage than it had. A floor, by contrast, only decides which nodes re-emit -- and ancestors
+  // come along for free, because a node holding a new point has node_max >= floor and every
+  // ancestor's cell contains that node, so no ancestor can satisfy node_max < floor either.
+  //
+  // Safe only while mutable, which suppresses both consumers of lod_watermark (the finality flip
+  // and emit_band_job). finalize re-advances it to terminal before either comes back.
+  _event_loop.run_in_loop([this, floor]() {
+    if (floor < _tree_registry.lod_watermark)
+      _tree_registry.lod_watermark = floor;
+    if (floor < _pass_watermark)
+      _pass_watermark = floor;
+    if (floor < _pending_pass_watermark)
+      _pending_pass_watermark = floor;
+    _tree_lod_generator.restore_lod_complete_morton(floor);
+  });
 }
 
 void tree_handler_t::request_all_trees()
