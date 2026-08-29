@@ -295,6 +295,55 @@ bool tree_deserialize(const serialized_tree_t &serialized_tree, tree_t &tree, de
 // construction), or a reader chunk whose registry-recorded point count equals the subset's. A
 // chunk with no refs entry (cache written before registry v3) counts as NOT collapsed -- the
 // collapse pass rewrites it, which is always safe.
+#ifndef NDEBUG
+void tree_compute_mins(tree_t &tree)
+{
+  // The walk mirrors tree_get_work_items (tree_lod_generator.cpp): a node's minimum morton is
+  // set_name_in_morton(magnitude, tree.morton_min, name), where the root's name is the tree's own
+  // child mask shifted into the top slot and each child's name comes from its PARENT'S node id --
+  // not from the parent's name. Getting that wrong is loud rather than silent: the LOD walk asserts
+  // mins[level][skip] == the derived node_min on every node it visits.
+  for (int level = 0; level < 5; level++)
+    tree.mins[level].assign(tree.nodes[level].size(), morton::morton192_t{});
+  if (tree.nodes[0].empty())
+    return;
+
+  struct entry_t
+  {
+    uint16_t skip;
+    uint16_t name;
+  };
+  std::vector<entry_t> current;
+  std::vector<entry_t> next;
+  const uint16_t root_name = morton::morton_get_child_mask(morton::morton_magnitude_to_lod(tree.magnitude), tree.morton_min);
+  current.push_back({uint16_t(0), uint16_t(root_name << (4 * 3))});
+
+  for (int level = 0; level < 5 && !current.empty(); level++)
+  {
+    next.clear();
+    for (const auto &entry : current)
+    {
+      if (entry.skip >= tree.mins[level].size())
+        continue; // a truncated/foreign blob: leave the rest zeroed rather than walk off the end
+      tree.mins[level][entry.skip] = morton::set_name_in_morton(tree.magnitude, tree.morton_min, entry.name);
+      if (level == 4)
+        continue; // level 4's children live in sub-trees, which carry their own mins
+      const uint8_t node = tree.nodes[level][entry.skip];
+      const uint16_t parent_node_name = uint16_t(tree.node_ids[level][entry.skip] << 3);
+      int child_count = 0;
+      for (int child_index = 0; child_index < 8; child_index++)
+      {
+        if (!(node & uint8_t(1 << child_index)))
+          continue;
+        next.push_back({uint16_t(tree.skips[level][entry.skip] + child_count), morton::morton_get_name(parent_node_name, level, child_index)});
+        child_count++;
+      }
+    }
+    current.swap(next);
+  }
+}
+#endif
+
 void tree_compute_leaves_collapsed(tree_t &tree, const tree_registry_t &tree_registry)
 {
   tree.leaves_collapsed = true;

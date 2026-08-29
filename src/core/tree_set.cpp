@@ -71,6 +71,9 @@ bool tree_set_t::install(tree_id_t id, const serialized_tree_t &data, dew_error_
   if (!tree_deserialize(data, *tree, error))
     return false;
   tree_compute_leaves_collapsed(*tree, _registry);
+  #ifndef NDEBUG
+  tree_compute_mins(*tree); // debug-only shadow, never serialized -- see tree.hpp
+  #endif
   _registry.data[id.data] = std::move(tree);
   if (_registry.tree_id_initialized.size() < _registry.data.size())
     _registry.tree_id_initialized.resize(_registry.data.size());

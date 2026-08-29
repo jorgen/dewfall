@@ -201,6 +201,16 @@ bool tree_deserialize(const serialized_tree_t &serialized_tree, tree_t &tree, de
 
 // Recompute tree_t::leaves_collapsed after deserialization (needs the registry's chunk table).
 void tree_compute_leaves_collapsed(tree_t &tree, const tree_registry_t &tree_registry);
+#ifndef NDEBUG
+// Rebuild tree_t::mins, the debug-only shadow of each node's minimum morton.
+//
+// mins is maintained alongside the tree while it is BUILT and is never serialized (it exists only to
+// assert the structure stays consistent). A tree loaded from disk therefore has empty mins arrays,
+// and inserting points into one indexes them out of range -- which only became reachable once a
+// dataset could be reopened and added to. Recompute it on load, exactly as tree_compute_leaves_collapsed
+// recomputes the other transient.
+void tree_compute_mins(tree_t &tree);
+#endif
 
 serialized_tree_registry_t tree_registry_serialize(const tree_registry_t &tree_registry);
 

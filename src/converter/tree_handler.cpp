@@ -202,6 +202,33 @@ void tree_handler_t::set_tree_initialization_node_point_limit(uint32_t limit)
   _pre_init_tree_config.node_point_limit = limit;
 }
 
+void tree_handler_t::set_mutable(bool value)
+{
+  // BOTH configs, because which one survives depends on when this is called.
+  //
+  //  * Before the first file, the configuration is not yet sealed and seal_configuration() will
+  //    overwrite the registry's copy wholesale from _pre_init_tree_config -- so setting only the
+  //    registry silently loses the flag on a fresh dataset.
+  //  * On a reopened dataset the configuration is already sealed and _pre_init_tree_config is dead,
+  //    so setting only that would silently lose it there instead.
+  //
+  // Unlike the other tree_initialization setters this deliberately does NOT assert on a sealed
+  // configuration: it changes no stored geometry, and being settable after a reopen is the point.
+  {
+    std::unique_lock<std::mutex> lock(_configuration_mutex);
+    _pre_init_tree_config.mutable_dataset = value ? 1 : 0;
+  }
+  // _tree_registry belongs to the tree loop, which may be mid-checkpoint. Post rather than write
+  // across threads -- same discipline as generate_lod.
+  _event_loop.run_in_loop([this, value]() { _tree_registry.tree_config.mutable_dataset = value ? 1 : 0; });
+}
+
+bool tree_handler_t::is_mutable()
+{
+  std::unique_lock<std::mutex> lock(_configuration_mutex);
+  return (_configuration_initialized ? _tree_registry.tree_config : _pre_init_tree_config).mutable_dataset != 0;
+}
+
 void tree_handler_t::set_tree_initialization_read_chunk_bytes(uint64_t bytes)
 {
   std::unique_lock<std::mutex> lock(_configuration_mutex);
@@ -312,6 +339,11 @@ void tree_handler_t::mark_band_uploaded(uint32_t band_id, std::vector<uint32_t> 
 void tree_handler_t::emit_band_job()
 {
   if (!_band_sink)
+    return;
+  // Suppressing the finality flip alone is NOT enough: job.terminal is derived from the watermark
+  // rather than from any tree, and the trees-empty early-out below lets a terminal job through --
+  // which writes the registry snapshot and seals the bucket. Nothing ships until finalize.
+  if (_tree_registry.tree_config.mutable_dataset)
     return;
   band_job_t job;
   job.band_id = _next_band_id;
@@ -506,7 +538,11 @@ vio::task_t<void> tree_handler_t::do_serialize_trees()
       // leaves_collapsed gates finality: bands must only ever ship per-node units, and a building
       // tree loaded after its range passed the watermark must not be flipped final by a mid-pass
       // cache-pressure checkpoint before the collapse phase has seen it.
-      if (state == uint8_t(tree_state_t::building) && tree->leaves_collapsed && (terminal_pass || tree->morton_max < _pass_watermark))
+      // A MUTABLE dataset is never sealed: finality is what makes a tree uploadable and evictable,
+      // and an evicted tree cannot be amended. dew_converter_finalize clears the flag and the next
+      // checkpoint seals in the ordinary way.
+      if (!_tree_registry.tree_config.mutable_dataset && state == uint8_t(tree_state_t::building) && tree->leaves_collapsed &&
+          (terminal_pass || tree->morton_max < _pass_watermark))
         state = uint8_t(tree_state_t::final);
     }
   }
@@ -680,6 +716,9 @@ void tree_handler_t::handle_deserialize_tree(tree_id_t &&tree_id, serialized_tre
   auto ret = tree_deserialize(data, *tree, error);
   if (ret)
     tree_compute_leaves_collapsed(*tree, _tree_registry);
+    #ifndef NDEBUG
+    tree_compute_mins(*tree); // debug-only shadow, never serialized -- see tree.hpp
+    #endif
   if (!ret)
   {
     fmt::print("Error deserializing tree registry {}\n", error.msg);
