@@ -20,17 +20,52 @@
 #include <string>
 #include <vector>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include <fmt/format.h>
 
+#include <dew/converter/converter.h>
+
+#include "ford_convert.hpp"
 #include "ford_dataset.hpp"
 #include "ppm.hpp"
 
 namespace
 {
 
+// Runtime callbacks. They fire on converter threads, so they only touch atomics and stderr.
+std::atomic<double> g_progress{0.0};
+std::atomic<int> g_errors{0};
+
+void on_progress(void *, float fraction)
+{
+  g_progress.store(double(fraction), std::memory_order_relaxed);
+}
+
+void on_warning(void *, const char *message)
+{
+  fmt::print(stderr, "\n  warning: {}\n", message ? message : "");
+}
+
+void on_error(void *, const struct dew_error_t *error)
+{
+  g_errors.fetch_add(1, std::memory_order_relaxed);
+  int code = 0;
+  const char *message = nullptr;
+  size_t length = 0;
+  if (error)
+    dew_error_get_info(error, &code, &message, &length);
+  fmt::print(stderr, "\n  error ({}): {}\n", code, std::string(message ? message : "", length));
+}
+
 int usage()
 {
-  fmt::print(stderr, "usage: ford_import inspect <dataset-root> [--scan N]\n");
+  fmt::print(stderr,
+             "usage:\n"
+             "  ford_import inspect <dataset-root> [--scan N]\n"
+             "  ford_import convert <dataset-root> <output.dew> [--scans N] [--scale M] [--stride N]\n");
   return 2;
 }
 
@@ -142,6 +177,141 @@ int inspect(const std::string &root, int scan_ordinal)
   return 0;
 }
 
+
+int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride)
+{
+  std::string error;
+  ford::dataset_t dataset;
+  if (!ford::dataset_open(root, dataset, error))
+  {
+    fmt::print(stderr, "error: {}\n", error);
+    return 1;
+  }
+  if (scan_limit > 0 && size_t(scan_limit) < dataset.scan_paths.size())
+    dataset.scan_paths.resize(size_t(scan_limit));
+
+  // The key packs the scan number into 12 bits, so a dataset numbered past 4095 needs a wider key.
+  // Checked rather than assumed, because the failure mode is silent: an overflowing scan id would
+  // alias onto another scan's points and the colour pass would quietly paint the wrong ones.
+  for (const auto &path : dataset.scan_paths)
+  {
+    const uint32_t id = ford::scan_id_from_path(path);
+    if (id > ford::k_max_scan_id)
+    {
+      fmt::print(stderr, "error: scan id {} (from {}) exceeds the {} that scan_key reserves 12 bits for\n", id, path, ford::k_max_scan_id);
+      return 1;
+    }
+  }
+
+  fmt::print("{}\n  {} scans to import\n", root, dataset.scan_paths.size());
+
+  // Pass 0: where is the data? Sampling the trajectory rather than reading every scan, because the
+  // box only has to bracket, and the padding covers what a sample misses.
+  const auto probe_start = std::chrono::steady_clock::now();
+  double world_min[3], world_max[3];
+  size_t sampled = 0;
+  if (!ford::ford_trajectory_bounds(dataset, size_t(stride < 1 ? 1 : stride), world_min, world_max, sampled, error))
+  {
+    fmt::print(stderr, "error: {}\n", error);
+    return 1;
+  }
+  const double probe_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - probe_start).count();
+  fmt::print("  trajectory from {} sampled poses in {:.1f}s\n", sampled, probe_s);
+  fmt::print("  world box [{:.1f} {:.1f} {:.1f}] .. [{:.1f} {:.1f} {:.1f}]  ({:.0f} x {:.0f} x {:.0f} m)\n", world_min[0], world_min[1], world_min[2], world_max[0], world_max[1], world_max[2],
+             world_max[0] - world_min[0], world_max[1] - world_min[1], world_max[2] - world_min[2]);
+
+  ford::ford_configure_import(dataset, scale, world_min, world_max);
+
+  dew_error_t *create_error = nullptr;
+  auto *converter = dew_converter_create(output.c_str(), output.size(), dew_open_file_semantics_truncate, &create_error);
+  if (!converter)
+  {
+    int code = 0;
+    const char *message = nullptr;
+    size_t length = 0;
+    if (create_error)
+      dew_error_get_info(create_error, &code, &message, &length);
+    fmt::print(stderr, "error: cannot create {}: {}\n", output, std::string(message ? message : "", length));
+    return 1;
+  }
+
+  // MUTABLE, so the dataset stays amendable: pass 2 adds colour to it without reconverting. It is
+  // sealed by dew_converter_finalize once nothing more will be added.
+  dew_converter_set_mutable(converter, 1);
+  // Without this the key does not survive LOD -- the default keep-list is rgb/intensity/
+  // classification, so coarse nodes would drop scan_key and only the leaves could be coloured.
+  dew_converter_set_lod_all_attributes(converter, 1);
+  ford::ford_install_callbacks(converter);
+
+  std::vector<std::string> names = dataset.scan_paths;
+  std::vector<dew_converter_str_buffer> buffers;
+  buffers.reserve(names.size());
+  for (const auto &name : names)
+    buffers.push_back({name.c_str(), uint32_t(name.size())});
+
+  const auto start = std::chrono::steady_clock::now();
+  fmt::print("\nconverting to {} at {:g} m ...\n", output, scale);
+  dew_converter_add_data_file(converter, buffers.data(), uint32_t(buffers.size()));
+  dew_converter_runtime_callbacks_t runtime{};
+  runtime.progress = on_progress;
+  runtime.warning = on_warning;
+  runtime.error = on_error;
+  dew_converter_set_runtime_callbacks(converter, runtime, nullptr);
+
+  // wait_idle blocks, so the progress line is driven from a watcher. It is also the only thing that
+  // would notice a stall: a conversion that stops advancing shows a frozen scan count rather than
+  // simply never returning.
+  std::atomic<bool> finished{false};
+  std::thread watcher([&] {
+    size_t scans = 0, points = 0, failed = 0;
+    while (!finished.load(std::memory_order_relaxed))
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      ford::ford_import_progress(scans, points, failed);
+      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      fmt::print("\r  {:6.1f}s  {} scans read, {} points, {:.0f}% converted   ", seconds, scans, points, 100.0 * g_progress.load(std::memory_order_relaxed));
+    }
+  });
+  dew_converter_wait_idle(converter);
+  finished.store(true, std::memory_order_relaxed);
+  watcher.join();
+  fmt::print("\n");
+
+  size_t scans_done = 0, points_done = 0, scans_failed = 0;
+  ford::ford_import_progress(scans_done, points_done, scans_failed);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+  // A per-file decode failure latches the converter's error status, but the points that DID land are
+  // perfectly good -- so only an import that produced nothing is fatal. The Ford release ships at
+  // least one truncated scan, and refusing the other 3816 over it would be absurd.
+  const bool failed = scans_done == 0;
+  if (!failed)
+    dew_converter_finalize(converter);
+
+  dew_converter_stats_t stats{};
+  const bool have_stats = dew_converter_get_compression_stats(converter, &stats);
+  dew_converter_destroy(converter);
+
+  if (failed)
+  {
+    fmt::print(stderr, "\nerror: conversion failed\n");
+    return 1;
+  }
+  fmt::print("  {} scans, {} points in {:.1f}s ({:.0f} points/s)\n", scans_done, points_done, elapsed, elapsed > 0 ? double(points_done) / elapsed : 0.0);
+  if (have_stats)
+  {
+    uint64_t raw = 0, packed = 0;
+    for (uint32_t i = 0; i < stats.attribute_count; i++)
+    {
+      raw += stats.attributes[i].uncompressed_bytes;
+      packed += stats.attributes[i].compressed_bytes;
+      fmt::print("    {:<12} {:9.2f} MB -> {:8.2f} MB\n", stats.attributes[i].name, double(stats.attributes[i].uncompressed_bytes) / 1e6, double(stats.attributes[i].compressed_bytes) / 1e6);
+    }
+    fmt::print("    {:<12} {:9.2f} MB -> {:8.2f} MB\n", "total", double(raw) / 1e6, double(packed) / 1e6);
+  }
+  fmt::print("\ninspect it with:  dew info {}\n", output);
+  return 0;
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -154,14 +324,38 @@ int main(int argc, char **argv)
   const std::string command = argv[1];
   const std::string root = argv[2];
   int scan_ordinal = 0;
-  for (int i = 3; i < argc; i++)
+  int scan_limit = 0;
+  int stride = 32;
+  double scale = 0.001;
+  std::string output;
+  int first_option = 3;
+  if (command == "convert")
+  {
+    if (argc < 4)
+      return usage();
+    output = argv[3];
+    first_option = 4;
+  }
+  for (int i = first_option; i < argc; i++)
   {
     if (strcmp(argv[i], "--scan") == 0 && i + 1 < argc)
       scan_ordinal = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--scans") == 0 && i + 1 < argc)
+      scan_limit = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--stride") == 0 && i + 1 < argc)
+      stride = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
+      scale = atof(argv[++i]);
     else
       return usage();
   }
   if (command == "inspect")
     return inspect(root, scan_ordinal);
+  if (command == "convert")
+  {
+    if (output.empty())
+      return usage();
+    return convert(root, output, scan_limit, scale, stride);
+  }
   return usage();
 }

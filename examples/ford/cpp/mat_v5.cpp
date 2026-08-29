@@ -419,20 +419,35 @@ bool inflate_zlib(const uint8_t *data, size_t size, size_t size_hint, std::vecto
     // output buffer was too small and we go round again.
     const int rc = zng_inflate(&stream, Z_FINISH);
     const size_t produced = size_t(stream.total_out);
+    // WHY avail_out DECIDES, and not the return code. Z_BUF_ERROR means only "no progress was
+    // possible", which under Z_FINISH covers two completely different situations: the output buffer
+    // filled up, or the input ran out mid-stream. Retrying is right for the first and a disaster for
+    // the second -- a truncated file can never be satisfied, so the buffer just doubles until the
+    // allocator gives up. One damaged scan in the Ford release (Scan0111.mat) hangs an import that
+    // way, and it presents as the converter waiting forever on an input that never reports.
+    //
+    // If output room is LEFT OVER and the stream still did not end, the input is what ran out.
+    const bool output_was_full = stream.avail_out == 0;
+    const char *message = stream.msg ? stream.msg : "no message";
     zng_inflateEnd(&stream);
     if (rc == Z_STREAM_END)
     {
       out.resize(produced);
       return true;
     }
+    if (!output_was_full)
+    {
+      error = fmt::format("truncated or corrupt zlib stream: inflate returned {} ({}) after {} bytes with {} bytes of output room to spare", rc, message, produced, capacity - produced);
+      return false;
+    }
     if (rc != Z_OK && rc != Z_BUF_ERROR)
     {
-      error = fmt::format("inflate failed: {} ({})", rc, stream.msg ? stream.msg : "no message");
+      error = fmt::format("inflate failed: {} ({})", rc, message);
       return false;
     }
     capacity *= 2;
   }
-  error = "inflate did not converge (output grew past 24 doublings of the hint)";
+  error = fmt::format("inflate did not converge: output exceeded {} bytes", capacity);
   return false;
 }
 
