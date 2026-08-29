@@ -42,6 +42,8 @@
 // to be there. Reachable today with two input files of differing attribute sets; the normal case
 // the moment half a dataset has been amended.
 
+#include <chrono>
+
 #include <doctest/doctest.h>
 
 #include "attributes_configs.hpp"
@@ -1302,7 +1304,14 @@ TEST_CASE("mutable: destination mode ships nothing until finalize")
     return; // hermetic skip when no object store is configured
 
   const std::string bucket = std::getenv("DEW_TEST_S3_BUCKET") ? std::getenv("DEW_TEST_S3_BUCKET") : "pointstest";
-  const std::string destination = "s3://" + bucket + "/mutable_flow";
+  // A FRESH prefix per  run. A bucket dataset is claimed by the uuid its first session writes into the
+  // root manifest, and there is no API that unclaims it -- so reusing one prefix means the test
+  // passes exactly once and then fails on every rerun with a uuid mismatch, which reads like a
+  // regression and is not one. Each run therefore leaves one prefix behind; purge with
+  //   mc rm -r --force local/<bucket>/mutable_flow_*
+  const auto stamp = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^ uint64_t(std::chrono::system_clock::now().time_since_epoch().count());
+  const std::string destination = "s3://" + bucket + "/mutable_flow_" + std::to_string(stamp);
+  MESSAGE("destination: ", destination);
   constexpr const char *cache = "attribute_amend_bucket_cache.dew";
   std::remove(cache);
 
@@ -1323,8 +1332,28 @@ TEST_CASE("mutable: destination mode ships nothing until finalize")
   MESSAGE("reading back from ", destination);
   dew_error_t *error = nullptr;
   auto *dataset = dew_dataset_create(destination.c_str(), uint32_t(destination.size()), nullptr, 0, nullptr, nullptr, &error);
+  if (!dataset && error)
+  {
+    int code = 0;
+    const char *str = nullptr;
+    size_t len = 0;
+    dew_error_get_info(error, &code, &str, &len);
+    MESSAGE("dew_dataset_create failed (", code, "): ", std::string(str ? str : "", len));
+  }
   REQUIRE(dataset != nullptr);
-  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+  const auto ready = dew_dataset_wait_ready(dataset, -1);
+  if (ready != dew_dataset_ready)
+  {
+    dew_error_t *ready_error = nullptr;
+    dew_dataset_get_error(dataset, &ready_error);
+    int code = 0;
+    const char *str = nullptr;
+    size_t len = 0;
+    if (ready_error)
+      dew_error_get_info(ready_error, &code, &str, &len);
+    MESSAGE("dataset not ready (", int(ready), ") code ", code, ": ", std::string(str ? str : "", len));
+  }
+  REQUIRE(ready == dew_dataset_ready);
 
   dew_region_request_t spec{};
   for (int i = 0; i < 3; i++)

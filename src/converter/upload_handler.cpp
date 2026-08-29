@@ -17,6 +17,8 @@
 ************************************************************************/
 #include "upload_handler.hpp"
 
+#include "loop_quiesce.hpp"
+
 #include "memory_writer.hpp"
 
 #include <vio/objstore/create_object_store.h>
@@ -102,6 +104,21 @@ upload_handler_t::~upload_handler_t()
 
 void upload_handler_t::stop()
 {
+  // The io manager owns this loop's TCP handles, and its destructor uv_close()es them. Left to
+  // member order it is destroyed AFTER the loop thread has joined, so those closes sit queued on a
+  // loop nobody will ever run again: uv_loop_close then answers EBUSY and vio's event_loop_t
+  // destructor asserts -- which is what made every destination-mode run abort on teardown in a debug
+  // build, long after the upload itself had succeeded.
+  //
+  // So it goes first, ON the loop, while the loop is still alive to reap them. stop_and_join's
+  // exit_event_loop_cb runs a nested uv_run that then finishes the close callbacks. Callers drain
+  // (wait_drained) before stopping and a parked band has already returned, so no coroutine is
+  // suspended inside an _io operation here.
+  if (_io)
+  {
+    if (!core::run_on_loop_and_wait(_loop, [this]() { _io.reset(); }))
+      _io.reset(); // bounded, like every teardown barrier: a narrow race beats a hang in a destructor
+  }
   _loop_thread.stop_and_join();
 }
 
@@ -550,6 +567,7 @@ bool upload_handler_t::drained() const
 
 void upload_handler_t::wait_drained()
 {
+
   std::unique_lock<std::mutex> lock(_stats_mutex);
   _drained_cv.wait(lock, [&] { return _stats.parked || _stats.bands_committed >= _enqueued_bands + _bootstrap_band_count; });
 }
