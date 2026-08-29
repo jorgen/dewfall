@@ -113,6 +113,33 @@ macro(Build3rdParty)
     unset(ZSTD_BUILD_SHARED CACHE)
     unset(ZSTD_BUILD_STATIC CACHE)
     unset(ZSTD_BUILD_TESTS CACHE)
+    # zlib-ng, for examples/ford. Built in its NATIVE mode (ZLIB_COMPAT off): the header is
+    # <zlib-ng.h> and the symbols are zng_*, so it cannot collide with a system zlib that something
+    # else in the link drags in. ZLIB_ALIASES would add plain `zlib`/`zlibstatic` target names for
+    # drop-in consumers; off, because a global target called `zlib` is exactly the kind of name that
+    # collides later. BUILD_TESTING defaults ON here and pulls gtest, so it must be forced off.
+    if (DEW_BUILD_EXAMPLES)
+        set(ZLIB_COMPAT OFF CACHE BOOL "" FORCE)
+        set(ZLIB_ALIASES OFF CACHE BOOL "" FORCE)
+        set(WITH_GZFILEOP OFF CACHE BOOL "" FORCE)   # we inflate memory buffers; no gzFile needed
+        set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+        set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+        set(WITH_BENCHMARKS OFF CACHE BOOL "" FORCE)
+        set(WITH_BENCHMARK_APPS OFF CACHE BOOL "" FORCE)
+        set(INSTALL_UTILS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(${zlib_ng_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/zlib_ng_build SYSTEM)
+        unset(ZLIB_COMPAT CACHE)
+        unset(ZLIB_ALIASES CACHE)
+        unset(WITH_GZFILEOP CACHE)
+        unset(BUILD_TESTING CACHE)
+        unset(ZLIB_ENABLE_TESTS CACHE)
+        unset(WITH_GTEST CACHE)
+        unset(WITH_BENCHMARKS CACHE)
+        unset(WITH_BENCHMARK_APPS CACHE)
+        unset(INSTALL_UTILS CACHE)
+    endif ()
+
     set(BUILD_SHARED_LIBS ${OLD_BUILD_SHARED_LIBS})
     include(${cmakerc_SOURCE_DIR}/CMakeRC.cmake)
 

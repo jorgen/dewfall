@@ -8,3 +8,4 @@ endfunction()
 
 add_subdirectory(renderer)
 add_subdirectory(query_async)
+add_subdirectory(ford)

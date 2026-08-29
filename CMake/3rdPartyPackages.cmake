@@ -21,6 +21,14 @@ CmDepFetchPackage(unordered_dense 4.1.2 https://github.com/martinus/unordered_de
 CmDepFetchPackage(zstd 1.5.7 https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz SHA256=37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3)
 CmDepFetchFile(stbimage b42009b https://raw.githubusercontent.com/nothings/stb/8b5f1f37b5b75829fc72d38e7b5d4bcbf8a26d55/stb_image.h stb_image.h SHA256=91f435e0fc6a620018b878b9859c74dff60d28046f87e649191ad6f35a98c722)
 
+# examples/ford only: the Ford scans are MATLAB v5 files whose payload is a single zlib (RFC1950)
+# stream, and nothing else in the tree can inflate one -- zstd's zlibWrapper is an API shim over real
+# zlib, not an implementation. Fetched only when examples are built, which also keeps it out of the
+# wasm build (EMSCRIPTEN forces DEW_BUILD_EXAMPLES off above CmDepFetch).
+if (DEW_BUILD_EXAMPLES)
+    CmDepFetchPackage(zlib_ng 2.3.3 https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz SHA256=f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1)
+endif ()
+
 # Python bindings only. The nanobind GitHub tarball does not contain the
 # ext/robin_map submodule, so robin-map is fetched separately and exposed as
 # the tsl::robin_map target before nanobind is added (see bindings/python).
