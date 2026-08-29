@@ -65,6 +65,12 @@ public:
   }
   void set_tree_initialization_node_point_limit(uint32_t limit);
   void set_tree_initialization_read_chunk_bytes(uint64_t bytes);
+  // Mutable mode: never flip a tree to `final`, and emit no bands. Unlike the tree_initialization
+  // setters above, this is legal AFTER the configuration is sealed -- it changes no stored geometry,
+  // and the whole point is to set it on a dataset that has already been converted and reopened.
+  // Posted to the tree loop, which owns _tree_registry; the next checkpoint persists it.
+  void set_mutable(bool value);
+  [[nodiscard]] bool is_mutable();
   void about_to_block() override;
   // Thread-safe: posts to the tree loop. The pass target/generator state belong to the tree loop,
   // which may be mid-checkpoint (serialize chain, band emission) when the processor advances the

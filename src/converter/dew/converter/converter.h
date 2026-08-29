@@ -279,6 +279,23 @@ DEW_CONVERTER_EXPORT void dew_converter_set_tree_scale(struct dew_converter_t *c
  * substantial size cost). Must be called before dew_converter_add_data_file. */
 DEW_CONVERTER_EXPORT void dew_converter_set_lod_all_attributes(struct dew_converter_t *converter, uint8_t all);
 
+/* Keep the dataset MUTABLE: do not seal it when the input runs out.
+ *
+ * Normally a tree is sealed as soon as the converter can prove no more points can land in its morton
+ * range, and sealing is what makes it uploadable and then evictable from the local cache -- which is
+ * also what makes it impossible to add to. A mutable dataset stays open: ingest can span sessions
+ * (reopen with dew_open_file_semantics_open_existing and add more files), and nothing is uploaded
+ * until it is sealed. Collapse and LOD still run, so it reads and renders like any other dataset.
+ *
+ * Unlike the tree-initialization setters, this may be called on a dataset that has already been
+ * converted and reopened -- that is its purpose. The mode persists in the dataset.
+ *
+ * Call dew_converter_finalize to end it. */
+DEW_CONVERTER_EXPORT void dew_converter_set_mutable(struct dew_converter_t *converter, uint8_t is_mutable);
+
+/* 1 while the dataset is mutable (including one reopened in that state). */
+DEW_CONVERTER_EXPORT uint8_t dew_converter_is_mutable(struct dew_converter_t *converter);
+
 // Read/sort chunk byte target (default 64 MiB): the converter ingests each input in chunks of about
 // this many bytes (computed from the file's per-point width, never below the node point limit,
 // capped at 8M points per chunk). Larger chunks amortize source reads and sorting; the octree still

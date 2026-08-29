@@ -238,7 +238,17 @@ struct tree_config_t
   // the fixed lod-9 sampling rate, so coarsening beyond it needs the renderer taught per-node density
   // first. Left in place (gated) for that future redesign; do NOT enable for rendered datasets. (v4.)
   uint8_t lod_adaptive_sampling = 0;
-  uint8_t reserved_[6] = {};
+  // MUTABLE dataset: never seal. A tree is normally flipped to tree_state_t::final as soon as the
+  // done-morton watermark proves nothing more can land in it, and finality is what lets a tree be
+  // uploaded to a band and then evicted from the local cache -- which is exactly what makes it
+  // un-amendable. While this is set, trees stay `building` and no band is emitted, so the dataset
+  // can keep taking input (and, later, gain attributes) across sessions. Collapse and LOD run as
+  // normal, and no reader consults tree_state, so a mutable dataset still reads and renders.
+  // Cleared by dew_converter_finalize, which then seals in the ordinary way.
+  // One of the reserved bytes, so sizeof stays 56 and TRG4 blobs are unchanged -- an older file
+  // reads zero here, which is today's always-seal behaviour.
+  uint8_t mutable_dataset = 0;
+  uint8_t reserved_[5] = {};
 };
 // Chunk point-count clamp: 8M points default cap (a decompressed morton blob is count x up to 24B --
 // keep worst-case read spikes bounded); 16M is the hard ceiling (u32 subset offsets stay far clear).

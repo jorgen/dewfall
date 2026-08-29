@@ -79,6 +79,15 @@ public:
   dew_error_t upgrade_to_write(bool truncate);
   void set_pre_init_tree_config(const tree_config_t &tree_config);
   void set_tree_scale_override(double scale);
+  // Mutable mode. Legal at any time, including on a reopened dataset -- see tree_handler_t::set_mutable.
+  void set_mutable(bool value)
+  {
+    _tree_handler.set_mutable(value);
+  }
+  [[nodiscard]] bool is_mutable()
+  {
+    return _tree_handler.is_mutable();
+  }
   tree_config_t tree_config_peek()
   {
     return _tree_handler.tree_config_peek();
