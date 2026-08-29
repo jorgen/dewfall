@@ -257,6 +257,21 @@ void dew_converter_finalize(dew_converter_t *converter)
   converter->processor.finalize();
 }
 
+uint8_t dew_converter_add_attribute(dew_converter_t *converter, const char *name, uint32_t name_size, const char *key_attribute, uint32_t key_attribute_size, dew_type_t type, dew_components_t components)
+{
+  return converter->processor.declare_attribute(std::string(name, name_size), std::string(key_attribute, key_attribute_size), type, components) ? 1 : 0;
+}
+
+uint8_t dew_converter_add_data_for_attribute(dew_converter_t *converter, const char *name, uint32_t name_size, const uint64_t *keys, const void *values, uint64_t count)
+{
+  return converter->processor.add_attribute_data(std::string(name, name_size), keys, values, count) ? 1 : 0;
+}
+
+void dew_converter_commit_attributes(dew_converter_t *converter)
+{
+  converter->processor.commit_attributes();
+}
+
 void dew_converter_set_compression_level(dew_converter_t *converter, int level)
 {
   converter->processor.storage_handler().set_compression_level(level);

@@ -307,6 +307,68 @@ DEW_CONVERTER_EXPORT uint8_t dew_converter_is_mutable(struct dew_converter_t *co
 //= blocking
 DEW_CONVERTER_EXPORT void dew_converter_finalize(struct dew_converter_t *converter);
 
+/* ---------------------------------------------------------------------------------------------
+ * Amending a mutable dataset with a new attribute.
+ *
+ * The workflow this exists for: convert the geometry once (which is the expensive part), then add
+ * intensity, then colour, then whatever else, each as a separate pass over data that may not have
+ * existed when the points were ingested.
+ *
+ * The join. New values arrive keyed, not ordered -- the converter reordered every point by morton
+ * code, split it across nodes and collapsed it, so the caller cannot know where its Nth point ended
+ * up. Instead the caller names an EXISTING attribute of the dataset to join on, and supplies
+ * (key, value) pairs. The key attribute must be a single-component integer type; its values are
+ * widened to uint64 and must be unique across the dataset. A dataset that wants to be amendable
+ * later therefore has to carry such a key from the start -- e.g. a scan id and a point index packed
+ * into one uint64 by the reader that ingested it.
+ *
+ * What this buys, and why LOD needs no special handling: an LOD node's key values are the key values
+ * of the points that were sampled into it. Joining the LOD nodes against the same table therefore
+ * gives each sampled point its own true value, for free. There is no separate LOD pass and no
+ * provenance metadata -- the key attribute IS the provenance.
+ *
+ * Points with no entry in the table get zeroes, matching what a node that lacks an attribute reads
+ * back as. A partially attributed dataset is legal.
+ *
+ * THE KEY MUST SURVIVE TO THE LOD LEVELS, or only the leaves are amended. LOD slimming keeps just
+ * rgb/intensity/classification by default (it dominated dataset size otherwise), so a dataset meant
+ * to be amended later must be converted with dew_converter_set_lod_all_attributes. Without it the
+ * amend is not wrong -- coarse nodes simply read the attribute back as zeros -- but the whole
+ * pyramid is what a renderer draws.
+ *
+ * Sequence:
+ *   dew_converter_set_mutable(c, 1);
+ *   dew_converter_add_attribute(c, "reflectance", 11, "point_key", 9, dew_type_r32, dew_components_1);
+ *   dew_converter_add_data_for_attribute(c, "reflectance", 11, keys, values, n);   // repeatable
+ *   dew_converter_commit_attributes(c);
+ *
+ * Only on a mutable dataset: a finalized one has trees that have been banded and evicted, and an
+ * amend has to read every unit it touches. */
+
+/* Declare an attribute the dataset does not have yet, and the existing attribute to join it on.
+ * Values are buffered until dew_converter_commit_attributes. Returns 0 and sets the converter to
+ * the error state if the dataset is not mutable, the name is already taken, or the key attribute
+ * is not a single-component integer type. */
+DEW_CONVERTER_EXPORT uint8_t dew_converter_add_attribute(struct dew_converter_t *converter, const char *name, uint32_t name_size, const char *key_attribute, uint32_t key_attribute_size,
+                                                         enum dew_type_t type, enum dew_components_t components);
+
+/* Supply values for a declared attribute. `keys` is `count` uint64 key values; `values` is `count`
+ * elements of the declared type and component count, contiguous. Both are copied. Callable as many
+ * times as it takes to deliver the data; a repeated key overwrites its earlier value.
+ *
+ * Skipped by the Python bindings: `values` has no static element type -- it follows whatever
+ * add_attribute declared -- so it wants a NumPy-aware wrapper rather than a generated pointer. */
+//= py.skip
+DEW_CONVERTER_EXPORT uint8_t dew_converter_add_data_for_attribute(struct dew_converter_t *converter, const char *name, uint32_t name_size, const uint64_t *keys, const void *values, uint64_t count);
+
+/* Apply every declared attribute to every unit of the dataset and drop the buffered values.
+ *
+ * Reads each unit's key buffer, writes one new blob per unit per attribute, and leaves the rest of
+ * the unit's blobs exactly where they were. Blocks until it has landed. Cost is one read and one
+ * write of one attribute per unit -- it does NOT recompress the units' other attributes. */
+//= blocking
+DEW_CONVERTER_EXPORT void dew_converter_commit_attributes(struct dew_converter_t *converter);
+
 // Read/sort chunk byte target (default 64 MiB): the converter ingests each input in chunks of about
 // this many bytes (computed from the file's per-point width, never below the node point limit,
 // capped at 8M points per chunk). Larger chunks amortize source reads and sorting; the octree still

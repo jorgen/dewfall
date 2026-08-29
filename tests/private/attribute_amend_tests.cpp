@@ -1347,3 +1347,413 @@ TEST_CASE("mutable: destination mode ships nothing until finalize")
 
   std::remove(cache);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 14. add_attribute / add_data_for_attribute: giving a converted dataset an attribute it never had.
+
+// The iterative workflow, end to end. Convert the geometry once carrying a join key, close, reopen,
+// and hand the dataset a value per key. Nothing is reconverted and no unit's existing blobs move.
+//
+// The key attribute is an ordinary attribute (here a u32 global point index) declared by the reader
+// at ingest. It is what makes the join possible at all: the converter reorders every point by morton
+// code, splits it across nodes, collapses chunks and samples LOD levels, so "my Nth point" means
+// nothing by the time the data is on disk.
+//
+// LOD nodes come along for free -- an LOD node's key values are the keys of the points sampled into
+// it, so joining against the same table gives each one its true value. That only works if the key
+// SURVIVES to the LOD levels, which needs lod_all_attributes: the default keep-list is
+// rgb/intensity/classification and would drop the key at the first LOD level.
+
+namespace
+{
+
+constexpr const char *k_key_name = "point_key";
+constexpr const char *k_amended_attribute = "reflectance";
+constexpr const char *k_keyed_input = "keyed";
+
+struct keyed_emit_state_t
+{
+  uint32_t emitted = 0;
+};
+
+dew_converter_file_pre_init_info_t keyed_pre_init(const char *, size_t, dew_error_t **)
+{
+  dew_converter_file_pre_init_info_t info{};
+  info.approximate_point_count = k_amend_points;
+  info.found_point_count = 1;
+  info.approximate_point_size_bytes = 16;
+  info.scale[0] = info.scale[1] = info.scale[2] = 1.0;
+  info.found_scale = 1;
+  return info;
+}
+
+void keyed_init(const char *, size_t, dew_converter_header_t *header, dew_attributes_t *attributes, void **user_ptr, dew_error_t **)
+{
+  header->point_count = k_amend_points;
+  for (int i = 0; i < 3; i++)
+  {
+    header->offset[i] = 0.0;
+    header->scale[i] = 1.0;
+    header->min[i] = 0.0;
+    header->max[i] = double(k_amend_grid);
+  }
+  dew_attributes_add_attribute(attributes, DEW_ATTRIBUTE_XYZ, uint32_t(strlen(DEW_ATTRIBUTE_XYZ)), dew_type_i32, dew_components_3);
+  dew_attributes_add_attribute(attributes, k_key_name, uint32_t(strlen(k_key_name)), dew_type_u32, dew_components_1);
+  *user_ptr = new keyed_emit_state_t();
+}
+
+// The key IS the point's index in the grid, so a point at key k sits at a position this test can
+// recompute -- which is what lets the check below tie a returned value back to a returned position
+// without trusting the ordering of either.
+void keyed_convert_data(void *user_ptr, const dew_converter_header_t *, const dew_attribute_t *, uint32_t, uint32_t max_points, dew_blob_t *buffers, uint32_t, uint32_t *points_read, uint8_t *done,
+                        dew_error_t **)
+{
+  auto *state = static_cast<keyed_emit_state_t *>(user_ptr);
+  const uint32_t remaining = k_amend_points - state->emitted;
+  const uint32_t n = remaining < max_points ? remaining : max_points;
+  auto *xyz = static_cast<int32_t *>(buffers[0].data);
+  auto *keys = static_cast<uint32_t *>(buffers[1].data);
+  for (uint32_t i = 0; i < n; i++)
+  {
+    const uint32_t p = state->emitted + i;
+    xyz[i * 3 + 0] = int32_t(p % k_amend_grid);
+    xyz[i * 3 + 1] = int32_t((p / k_amend_grid) % k_amend_grid);
+    xyz[i * 3 + 2] = int32_t(p / (k_amend_grid * k_amend_grid));
+    keys[i] = p;
+  }
+  state->emitted += n;
+  *points_read = n;
+  *done = state->emitted >= k_amend_points ? 1 : 0;
+}
+
+void keyed_destroy_user_ptr(void *user_ptr)
+{
+  delete static_cast<keyed_emit_state_t *>(user_ptr);
+}
+
+void set_keyed_callbacks(dew_converter_t *converter)
+{
+  dew_converter_file_convert_callbacks_t callbacks{};
+  callbacks.pre_init = keyed_pre_init;
+  callbacks.init = keyed_init;
+  callbacks.convert_data = keyed_convert_data;
+  callbacks.destroy_user_ptr = keyed_destroy_user_ptr;
+  dew_converter_set_file_converter_callbacks(converter, callbacks);
+}
+
+// The value a given key must come back with. Distinct per key and never zero, so "the amend did not
+// reach this point" (zeros) cannot pass for a real value.
+float expected_value(uint32_t key)
+{
+  return 1.0f + float(key) * 0.5f;
+}
+
+// A mutable dataset of keyed points, node limit tuned low enough to force several nodes and LOD
+// levels, with the key kept all the way up the pyramid.
+bool build_keyed_dataset(const char *path)
+{
+  std::remove(path);
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_truncate, &error);
+  if (!converter)
+  {
+    if (error)
+      dew_error_destroy(error);
+    return false;
+  }
+  dew_converter_set_mutable(converter, 1);
+  dew_converter_set_lod_all_attributes(converter, 1);
+  dew_converter_set_node_point_limit(converter, 700);
+  set_keyed_callbacks(converter);
+  dew_converter_str_buffer name{k_keyed_input, uint32_t(strlen(k_keyed_input))};
+  dew_converter_add_data_file(converter, &name, 1);
+  dew_converter_wait_idle(converter);
+  const bool ok = dew_converter_status(converter) != dew_conversion_status_error;
+  dew_converter_destroy(converter);
+  return ok;
+}
+
+} // namespace
+
+TEST_CASE("amend: a converted dataset gains an attribute it was never converted with")
+{
+  constexpr const char *path = "attribute_amend_add.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  // Reopen and amend. Separate session on purpose: this is the workflow -- convert now, produce the
+  // derived values later, join them on afterwards.
+  {
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+
+    REQUIRE(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 1);
+
+    // Delivered in two chunks, because a real caller streams: the second call must extend the table
+    // rather than replace it.
+    std::vector<uint64_t> keys(k_amend_points);
+    std::vector<float> values(k_amend_points);
+    for (uint32_t k = 0; k < k_amend_points; k++)
+    {
+      keys[k] = k;
+      values[k] = expected_value(k);
+    }
+    const uint32_t half = k_amend_points / 2;
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data(), values.data(), half) == 1);
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data() + half, values.data() + half, k_amend_points - half) == 1);
+
+    dew_converter_commit_attributes(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_finalize(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_destroy(converter);
+  }
+
+  // Read it back through the ordinary query path -- not through converter internals. The attribute
+  // has to be a first-class part of the dataset, indistinguishable from one that was converted in.
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  const char *attributes[] = {k_key_name, k_amended_attribute};
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.attribute_names = attributes;
+  spec.attribute_count = 2;
+  spec.position_format = dew_position_r64_absolute;
+
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  REQUIRE(result.point_count == k_amend_points);
+
+  const dew_attribute_buffer_t *key_buffer = nullptr;
+  const dew_attribute_buffer_t *value_buffer = nullptr;
+  for (uint32_t i = 0; i < result.buffer_count; i++)
+  {
+    if (!result.buffers[i].name)
+      continue;
+    if (strcmp(result.buffers[i].name, k_key_name) == 0)
+      key_buffer = &result.buffers[i];
+    else if (strcmp(result.buffers[i].name, k_amended_attribute) == 0)
+      value_buffer = &result.buffers[i];
+  }
+  // The attribute exists at all -- the query resolved it by name against the amended configs.
+  REQUIRE(value_buffer != nullptr);
+  REQUIRE(key_buffer != nullptr);
+
+  MESSAGE("key buffer: ", key_buffer->size_bytes, " bytes type ", int(key_buffer->type), "; value buffer: ", value_buffer->size_bytes, " bytes type ", int(value_buffer->type), "; points ",
+          result.point_count);
+  REQUIRE(key_buffer->size_bytes == result.point_count * sizeof(uint32_t));
+  REQUIRE(value_buffer->size_bytes == result.point_count * sizeof(float));
+  const auto *keys = static_cast<const uint32_t *>(key_buffer->data);
+  const auto *values = static_cast<const float *>(value_buffer->data);
+  uint64_t correct = 0, zero = 0, wrong = 0;
+  std::vector<uint8_t> seen(k_amend_points, 0);
+  for (uint64_t p = 0; p < result.point_count; p++)
+  {
+    const uint32_t key = keys[p];
+    REQUIRE(key < k_amend_points);
+    seen[key] = 1;
+    if (values[p] == expected_value(key))
+      correct++;
+    else if (values[p] == 0.0f)
+      zero++;
+    else
+      wrong++;
+  }
+  MESSAGE("amended: ", correct, " correct, ", zero, " zero, ", wrong, " wrong, over ", result.node_count, " nodes");
+  // Every point carries the value its own key was given -- not a neighbour's, and not a zero from a
+  // buffer the join never filled.
+  CHECK(wrong == 0);
+  CHECK(zero == 0);
+  CHECK(correct == k_amend_points);
+  // And every key appeared, so the frontier really was the whole dataset.
+  CHECK(std::count(seen.begin(), seen.end(), uint8_t(0)) == 0);
+
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  std::remove(path);
+}
+
+TEST_CASE("amend: LOD nodes get the amended attribute, sampled point by sampled point")
+{
+  // The claim that makes this cheap: an LOD node holds a SUBSET of its descendants' points, and its
+  // key buffer holds those points' keys. Joining it against the same table therefore needs no
+  // provenance metadata, no re-LOD, and no second pass -- the key attribute IS the provenance.
+  //
+  // Checked at a COARSE lod_pixel_size so the walk stops above the leaves and the frontier is made
+  // of LOD nodes. Every value returned there must still be its own point's.
+  constexpr const char *path = "attribute_amend_add_lod.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  {
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+    REQUIRE(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 1);
+    std::vector<uint64_t> keys(k_amend_points);
+    std::vector<float> values(k_amend_points);
+    for (uint32_t k = 0; k < k_amend_points; k++)
+    {
+      keys[k] = k;
+      values[k] = expected_value(k);
+    }
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data(), values.data(), k_amend_points) == 1);
+    dew_converter_commit_attributes(converter);
+    dew_converter_finalize(converter);
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_destroy(converter);
+  }
+
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+
+  const char *attributes[] = {k_key_name, k_amended_attribute};
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) + 1.0;
+  }
+  // An explicit level, not a point budget: the budget only bites once nodes have been EMITTED, and
+  // on a tree this small the whole leaf frontier is reached before the running total moves at all.
+  // Level 5 is tree 0's deepest level (its root cell spans lods 9..5), so the walk stops there and
+  // hands back LOD nodes.
+  spec.lod_mode = dew_lod_level;
+  spec.lod = 5;
+  spec.clip_mode = dew_clip_node;
+  spec.attribute_names = attributes;
+  spec.attribute_count = 2;
+  spec.position_format = dew_position_r64_absolute;
+
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  // A coarse frontier: strictly fewer points than the dataset, which is what proves these are LOD
+  // nodes and not the leaves.
+  MESSAGE("coarse frontier: ", result.point_count, " of ", k_amend_points, " points over ", result.node_count, " nodes");
+  REQUIRE(result.point_count > 0);
+  REQUIRE(result.point_count < k_amend_points);
+
+  const dew_attribute_buffer_t *key_buffer = nullptr;
+  const dew_attribute_buffer_t *value_buffer = nullptr;
+  for (uint32_t i = 0; i < result.buffer_count; i++)
+  {
+    if (!result.buffers[i].name)
+      continue;
+    if (strcmp(result.buffers[i].name, k_key_name) == 0)
+      key_buffer = &result.buffers[i];
+    else if (strcmp(result.buffers[i].name, k_amended_attribute) == 0)
+      value_buffer = &result.buffers[i];
+  }
+  REQUIRE(value_buffer != nullptr);
+  REQUIRE(key_buffer != nullptr);
+
+  const auto *keys = static_cast<const uint32_t *>(key_buffer->data);
+  const auto *values = static_cast<const float *>(value_buffer->data);
+  uint64_t correct = 0, mismatched = 0;
+  for (uint64_t p = 0; p < result.point_count; p++)
+  {
+    if (keys[p] < k_amend_points && values[p] == expected_value(keys[p]))
+      correct++;
+    else
+      mismatched++;
+  }
+  MESSAGE("LOD frontier: ", correct, " correct, ", mismatched, " mismatched");
+  CHECK(mismatched == 0);
+  CHECK(correct == result.point_count);
+
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  std::remove(path);
+}
+
+TEST_CASE("amend: a key the dataset does not carry leaves it untouched rather than corrupt")
+{
+  // The failure that must NOT be silent-but-wrong. Joining on an attribute no unit has cannot match
+  // anything; the dataset has to come back exactly as it was rather than gain a buffer of zeros
+  // masquerading as data, or worse, a config claiming a slot the location vector does not have.
+  constexpr const char *path = "attribute_amend_add_nokey.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  {
+    dew_error_t *error = nullptr;
+    auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+    REQUIRE(converter != nullptr);
+    dew_converter_set_mutable(converter, 1);
+    set_keyed_callbacks(converter);
+    REQUIRE(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), "not_an_attribute", 16, dew_type_r32, dew_components_1) == 1);
+    std::vector<uint64_t> keys{0, 1, 2};
+    std::vector<float> values{1.0f, 2.0f, 3.0f};
+    REQUIRE(dew_converter_add_data_for_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), keys.data(), values.data(), 3) == 1);
+    dew_converter_commit_attributes(converter);
+    // Not an error: a key that no unit carries is the same case as a key that only SOME units carry,
+    // which is legal and expected (LOD slimming drops it). It amends nothing.
+    REQUIRE(dew_converter_status(converter) != dew_conversion_status_error);
+    dew_converter_finalize(converter);
+    dew_converter_destroy(converter);
+  }
+
+  // Still readable, still complete, and without the attribute.
+  dew_error_t *error = nullptr;
+  auto *dataset = dew_dataset_create(path, uint32_t(strlen(path)), nullptr, 0, nullptr, nullptr, &error);
+  REQUIRE(dataset != nullptr);
+  REQUIRE(dew_dataset_wait_ready(dataset, -1) == dew_dataset_ready);
+  dew_region_request_t spec{};
+  for (int i = 0; i < 3; i++)
+  {
+    spec.aabb_min[i] = -1.0;
+    spec.aabb_max[i] = double(k_amend_grid) + 1.0;
+  }
+  spec.lod_mode = dew_lod_full;
+  spec.clip_mode = dew_clip_node;
+  spec.position_format = dew_position_r64_absolute;
+  auto *request = dew_dataset_request_region(dataset, &spec, nullptr);
+  REQUIRE(request != nullptr);
+  REQUIRE(dew_request_wait(request, -1) == dew_request_completed);
+  dew_request_result_t result{};
+  REQUIRE(dew_request_get_result(request, &result) == 1);
+  CHECK(result.point_count == k_amend_points);
+  dew_request_release(request);
+  dew_dataset_close(dataset);
+  std::remove(path);
+}
+
+TEST_CASE("amend: declaring an attribute on a dataset that is not mutable is refused")
+{
+  // A finalized dataset has trees that were banded and, in destination mode, evicted -- an amend has
+  // to read every unit it touches, so it must be refused up front rather than half-applied.
+  constexpr const char *path = "attribute_amend_add_immutable.dew";
+  REQUIRE(build_keyed_dataset(path));
+
+  dew_error_t *error = nullptr;
+  auto *converter = dew_converter_create(path, strlen(path), dew_open_file_semantics_open_existing, &error);
+  REQUIRE(converter != nullptr);
+  set_keyed_callbacks(converter);
+  CHECK(dew_converter_is_mutable(converter) == 1); // the dataset was left mutable; do not set it here
+  dew_converter_finalize(converter);
+  CHECK(dew_converter_is_mutable(converter) == 0);
+
+  CHECK(dew_converter_add_attribute(converter, k_amended_attribute, uint32_t(strlen(k_amended_attribute)), k_key_name, uint32_t(strlen(k_key_name)), dew_type_r32, dew_components_1) == 0);
+  CHECK(dew_converter_status(converter) == dew_conversion_status_error);
+  dew_converter_destroy(converter);
+  std::remove(path);
+}

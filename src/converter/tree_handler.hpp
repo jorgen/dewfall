@@ -41,6 +41,24 @@ struct waiting_for_root_t
   std::condition_variable *cv;
 };
 
+// One unit as the amend sees it: which tree owns it, its id, the config it currently has, and where
+// its blobs are (indexed by that config's attribute order).
+struct storage_unit_ref_t
+{
+  tree_id_t tree;
+  input_data_id_t id;
+  attributes_id_t attributes_id;
+  std::vector<storage_location_t> storage;
+};
+
+struct storage_unit_append_t
+{
+  tree_id_t tree;
+  input_data_id_t id;
+  attributes_id_t attributes_id;
+  std::vector<storage_location_t> locations;
+};
+
 class tree_handler_t : public vio::about_to_block_t
 {
 public:
@@ -62,6 +80,17 @@ public:
   // pointers and loads lazily, so a mutable dataset -- the only one that takes new points after a
   // reopen -- has to pull them all in first. Called once, at open.
   void request_all_trees();
+  // Every unit of every LOADED tree, snapshotted on the tree loop. For the attribute amend, which
+  // has to visit each unit exactly once and cannot hold the tree loop while it reads and writes.
+  // Only meaningful with all trees resident (mutable mode loads them at open).
+  std::vector<storage_unit_ref_t> snapshot_storage_units();
+  // Append one blob to each named unit and move it to a new attributes config, on the tree loop.
+  // Counterpart to the snapshot above: the amend computes the locations off-loop, then lands them
+  // all here in one hop. Units that vanished in between (they cannot, while nothing else runs, but
+  // the map is authoritative) are skipped rather than asserted on.
+  // False if the tree loop did not service the request; the caller must treat that as a failed
+  // amend, not a partial one -- the blobs are already written but nothing points at them yet.
+  [[nodiscard]] bool append_storage_units(std::vector<storage_unit_append_t> &&appends);
   // Re-open the LOD pyramid from `floor` upward, so an input added to an already-LOD-ed dataset is
   // covered. Only the floor moves; the pass target stays terminal. See the definition.
   void lower_lod_floor(const morton::morton192_t &floor);

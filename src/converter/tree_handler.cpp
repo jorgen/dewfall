@@ -196,6 +196,54 @@ void tree_handler_t::clear_mutable_and_wait()
     _tree_registry.tree_config.mutable_dataset = 0;
 }
 
+std::vector<storage_unit_ref_t> tree_handler_t::snapshot_storage_units()
+{
+  // The result is heap-owned and captured BY VALUE for the reason run_on_loop_and_wait spells out:
+  // on timeout this frame returns while the queued task is still pending, so a lambda holding a
+  // reference to a local would write into a dead stack the moment the loop got to it.
+  auto out = std::make_shared<std::vector<storage_unit_ref_t>>();
+  const bool ran = core::run_on_loop_and_wait(
+    _event_loop,
+    [this, out]() {
+      for (uint32_t i = 0; i < uint32_t(_tree_registry.data.size()); i++)
+      {
+        auto *tree = _tree_registry.data[i].get();
+        if (!tree)
+          continue;
+        const tree_id_t tree_id(i);
+        tree->storage_map.for_each([&out, tree_id](input_data_id_t id, attributes_id_t attributes_id, const std::vector<storage_location_t> &storage) {
+          out->push_back({tree_id, id, attributes_id, storage});
+        });
+      }
+    },
+    std::chrono::milliseconds(60000));
+  // A partial view would amend part of the dataset and report success. Empty is a failure the
+  // caller turns into an error; it cannot be confused with a real dataset, which always has units.
+  if (!ran)
+    return {};
+  return std::move(*out);
+}
+
+bool tree_handler_t::append_storage_units(std::vector<storage_unit_append_t> &&appends)
+{
+  auto work = std::make_shared<std::vector<storage_unit_append_t>>(std::move(appends));
+  return core::run_on_loop_and_wait(
+    _event_loop,
+    [this, work]() {
+      for (auto &append : *work)
+      {
+        auto *tree = append.tree.data < _tree_registry.data.size() ? _tree_registry.data[append.tree.data].get() : nullptr;
+        if (!tree || !tree->storage_map.contains(append.id))
+          continue;
+        tree->storage_map.append_storage(append.id, append.attributes_id, std::move(append.locations));
+        // Without this the amend is in memory only: do_serialize_trees serializes DIRTY trees, so a
+        // checkpoint would write the blobs' allocator state and none of the maps pointing at them.
+        tree->is_dirty = true;
+      }
+    },
+    std::chrono::milliseconds(60000));
+}
+
 void tree_handler_t::lower_lod_floor(const morton::morton192_t &floor)
 {
   // Re-open the LOD pyramid from `floor` upward so a newly added input is covered.

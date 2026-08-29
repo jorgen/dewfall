@@ -35,6 +35,7 @@
 #include <vio/thread_pool.h>
 
 #include "attributes_configs.hpp"
+#include "attribute_amend.hpp"
 #include "dataset_types.hpp"
 #include "frustum_tree_walker.hpp"
 #include "input_data_source_registry.hpp"
@@ -106,6 +107,12 @@ public:
   // Full quiesce: conversion pipeline idle AND (destination mode) the uploader drained/parked --
   // after this the dataset is durable at the destination (unless parked on errors).
   void wait_idle();
+  // Amending a mutable dataset with a new attribute (see attribute_amend.hpp and the public API
+  // comment in converter.h). declare/add_data only buffer; commit does the work and blocks.
+  bool declare_attribute(const std::string &name, const std::string &key_attribute, dew_type_t type, dew_components_t components);
+  bool add_attribute_data(const std::string &name, const uint64_t *keys, const void *values, uint64_t count);
+  void commit_attributes();
+
   // End mutable mode: seal the dataset and, in destination mode, ship it. Blocks until done.
   void finalize();
   // Conversion-only quiesce: the cache file is a complete valid DEW; uploads may still be running.
@@ -172,6 +179,7 @@ private:
   storage_handler_t _storage_handler;
   input_data_source_registry_t _input_data_source_registry;
   attributes_configs_t _attributes_configs;
+  attribute_amend_t _attribute_amend;
   tree_handler_t _tree_handler;
   // Destination mode (native only; null in classic local-only conversions).
   destination_config_t _destination;

@@ -306,6 +306,70 @@ void processor_t::finalize()
   wait_idle();
 }
 
+bool processor_t::declare_attribute(const std::string &name, const std::string &key_attribute, dew_type_t type, dew_components_t components)
+{
+  std::string message;
+  if (!_tree_handler.is_mutable())
+  {
+    message = "attributes can only be added to a mutable dataset";
+  }
+  else if (_attribute_amend.declare(name, key_attribute, type, components, message))
+  {
+    return true;
+  }
+  dew_error_t error;
+  error.code = -1;
+  error.msg = message;
+  handle_storage_error(std::move(error));
+  return false;
+}
+
+bool processor_t::add_attribute_data(const std::string &name, const uint64_t *keys, const void *values, uint64_t count)
+{
+  if (_attribute_amend.add_data(name, keys, values, count))
+    return true;
+  dew_error_t error;
+  error.code = -1;
+  error.msg = fmt::format("no attribute '{}' has been declared on this converter", name);
+  handle_storage_error(std::move(error));
+  return false;
+}
+
+void processor_t::commit_attributes()
+{
+  if (_attribute_amend.empty())
+    return;
+  if (!_tree_handler.is_mutable())
+  {
+    dew_error_t error;
+    error.code = -1;
+    error.msg = "attributes can only be committed to a mutable dataset";
+    handle_storage_error(std::move(error));
+    return;
+  }
+
+  // 1. Land everything in flight. The amend snapshots each unit's storage locations and then writes
+  //    against that snapshot; a conversion still placing blobs would be amending a moving dataset.
+  wait_local_complete();
+
+  // 2. Every tree has to be resident to be walked. Mutable mode loads them all at open, but an
+  //    amend can follow input added in the same session, which mints trees the open never saw.
+  _tree_handler.request_all_trees();
+
+  // 3. The pass itself: read each unit's key blob, write one new blob, record it.
+  auto error = _attribute_amend.commit(_tree_handler, _storage_handler, _attributes_configs);
+  if (error.code != 0)
+  {
+    handle_storage_error(std::move(error));
+    return;
+  }
+
+  // 4. Persist the storage maps that now point at those blobs. Without this the amend is in memory
+  //    only: the blobs are on disk, nothing references them, and the next open reads the old maps.
+  _tree_handler.checkpoint_and_wait();
+  wait_idle();
+}
+
 void processor_t::wait_idle()
 {
   // Full quiesce: conversion done (cache is a complete valid DEW), then every committed

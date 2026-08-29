@@ -51,6 +51,7 @@ set(sources
         node_decode.cpp
         upload_handler.cpp
         input_data_source_registry.cpp
+        attribute_amend.cpp
 )
 
 add_library(dew_converter_objects OBJECT ${public_headers} ${private_headers} ${sources})
