@@ -110,6 +110,36 @@ struct perf_stats_t
   std::atomic<uint64_t> cache_hits{0};
   std::atomic<uint64_t> cache_misses{0};
 
+  // THE READ PATH, SPLIT THREE WAYS. cache_hits above lumps together two outcomes that cost wildly
+  // different amounts: a decoded-cache hit is a map lookup, while a compressed-cache hit re-inflates
+  // the blob in full, every time. The aggregate read 99.5% on a conversion that was spending 60% of
+  // its CPU re-inflating; these are what make that visible.
+  std::atomic<uint64_t> read_decoded_hits{0};      // decoded bytes still cached: free
+  std::atomic<uint64_t> read_recompressed_hits{0}; // compressed bytes cached, decompressed AGAIN
+  std::atomic<uint64_t> read_misses{0};            // went to the backend
+  std::atomic<uint64_t> decompress_us{0};          // summed across threads, so it can exceed wall time
+  std::atomic<uint64_t> decompress_input_bytes{0};
+
+  // Leaf collapse, per-phase. The merge itself is a rounding error next to the reads and the
+  // attribute scatter, which is not what the name suggests.
+  std::atomic<uint64_t> collapse_jobs{0};
+  std::atomic<uint64_t> collapse_read_us{0};
+  std::atomic<uint64_t> collapse_merge_us{0};
+  std::atomic<uint64_t> collapse_attribute_us{0};
+  std::atomic<uint64_t> collapse_worker_us{0};
+  // (chunk x leaf) subset incidences. Grows with chunks TIMES leaves rather than with points, which
+  // is the suspected source of the phase's superlinear scaling at fixed spatial extent.
+  std::atomic<uint64_t> collapse_merge_entries{0};
+
+  // LOD generation, per-phase, summed across pool threads.
+  std::atomic<uint64_t> lod_workers{0};
+  std::atomic<uint64_t> lod_read_us{0};
+  std::atomic<uint64_t> lod_sample_us{0};
+  std::atomic<uint64_t> lod_attribute_us{0};
+  std::atomic<uint64_t> lod_attrib_map_us{0};
+  std::atomic<uint64_t> lod_write_post_us{0};
+  std::atomic<uint64_t> lod_worker_us{0};
+
   double total_time_seconds() const
   {
     auto dur = std::chrono::duration_cast<std::chrono::microseconds>(conversion_end - conversion_start).count();

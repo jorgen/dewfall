@@ -16,6 +16,8 @@
 ** along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ************************************************************************/
 #include "converter.hpp"
+
+#include <cstdio>
 #include <dew/converter/converter.h>
 
 #include "compressor.hpp"
@@ -176,6 +178,99 @@ void dew_converter_set_read_cache_bytes(dew_converter_t *converter, uint64_t max
 void dew_converter_set_decompressed_cache_bytes(dew_converter_t *converter, uint64_t max_bytes)
 {
   converter->processor.storage_handler().set_decompressed_cache_size(max_bytes);
+}
+
+// Write a machine-readable record of the run beside the dataset.
+//
+// Separate from dew info, which describes the DATASET. This describes the CONVERSION -- where the
+// time went and how much redundant work happened -- so two runs can be diffed. It is JSON because
+// the point is to compare runs mechanically, not to read one prettily.
+//
+// The counters that make it worth having are the ones an aggregate hides. `cache_hits` read 99.5% on
+// a conversion that was spending most of its CPU re-inflating blobs, because a decoded-cache hit and
+// a re-inflating hit were counted the same. read.decoded_hits vs read.recompressed_hits separates
+// them, and decompress.cpu_seconds against wall time says how much of the machine that cost.
+uint8_t dew_converter_write_stats(dew_converter_t *converter, const char *path, uint32_t path_size, dew_error_t **error)
+{
+  if (!converter || !path || !path_size)
+    return 0;
+  const std::string filename(path, path_size);
+  auto &ps = converter->processor.perf_stats();
+
+  const double wall = ps.total_time_seconds();
+  const auto us = [](const std::atomic<uint64_t> &v) { return double(v.load(std::memory_order_relaxed)) / 1e6; };
+  const auto n = [](const std::atomic<uint64_t> &v) { return v.load(std::memory_order_relaxed); };
+
+  const uint64_t decoded = n(ps.read_decoded_hits);
+  const uint64_t recompressed = n(ps.read_recompressed_hits);
+  const uint64_t misses = n(ps.read_misses);
+  const uint64_t reads = decoded + recompressed + misses;
+
+  std::string out;
+  out += "{\n";
+  out += fmt::format("  \"wall_seconds\": {:.3f},\n", wall);
+  out += "  \"phases\": {\n";
+  out += fmt::format("    \"tree_build_seconds\": {:.3f},\n", us(ps.tree_build_time_us));
+  out += fmt::format("    \"collapse_seconds\": {:.3f},\n", us(ps.collapse_time_us));
+  out += fmt::format("    \"lod_seconds\": {:.3f}\n", us(ps.lod_generation_time_us));
+  out += "  },\n";
+  out += "  \"collapse\": {\n";
+  out += fmt::format("    \"jobs\": {},\n", n(ps.collapse_jobs));
+  out += fmt::format("    \"merge_entries\": {},\n", n(ps.collapse_merge_entries));
+  out += fmt::format("    \"cpu_seconds\": {:.3f},\n", us(ps.collapse_worker_us));
+  out += fmt::format("    \"read_cpu_seconds\": {:.3f},\n", us(ps.collapse_read_us));
+  out += fmt::format("    \"merge_cpu_seconds\": {:.3f},\n", us(ps.collapse_merge_us));
+  out += fmt::format("    \"attribute_cpu_seconds\": {:.3f}\n", us(ps.collapse_attribute_us));
+  out += "  },\n";
+  // LOD counters are reset each pass, so these describe the LAST pass rather than the run.
+  out += "  \"lod_last_pass\": {\n";
+  out += fmt::format("    \"workers\": {},\n", n(ps.lod_workers));
+  out += fmt::format("    \"cpu_seconds\": {:.3f},\n", us(ps.lod_worker_us));
+  out += fmt::format("    \"read_cpu_seconds\": {:.3f},\n", us(ps.lod_read_us));
+  out += fmt::format("    \"sample_cpu_seconds\": {:.3f},\n", us(ps.lod_sample_us));
+  out += fmt::format("    \"attribute_cpu_seconds\": {:.3f}\n", us(ps.lod_attribute_us));
+  out += "  },\n";
+  out += "  \"read\": {\n";
+  out += fmt::format("    \"total\": {},\n", reads);
+  out += fmt::format("    \"decoded_hits\": {},\n", decoded);
+  out += fmt::format("    \"recompressed_hits\": {},\n", recompressed);
+  out += fmt::format("    \"misses\": {},\n", misses);
+  out += fmt::format("    \"decoded_hit_fraction\": {:.4f}\n", reads ? double(decoded) / double(reads) : 0.0);
+  out += "  },\n";
+  out += "  \"decompress\": {\n";
+  out += fmt::format("    \"cpu_seconds\": {:.3f},\n", us(ps.decompress_us));
+  out += fmt::format("    \"input_bytes\": {},\n", n(ps.decompress_input_bytes));
+  // How much of the machine went into decompression. Above 1.0 means more than one core's worth;
+  // it was near 10 on a 16-thread run before the decoded cache was sized.
+  out += fmt::format("    \"cores\": {:.2f}\n", wall > 0.0 ? us(ps.decompress_us) / wall : 0.0);
+  out += "  },\n";
+  out += "  \"io\": {\n";
+  const auto counter = [&](const char *name, const io_counter_t &c, bool last) {
+    return fmt::format("    \"{}\": {{ \"bytes\": {}, \"seconds\": {:.3f}, \"mb_per_second\": {:.1f} }}{}\n", name, c.total_bytes.load(std::memory_order_relaxed),
+                       double(c.total_time_us.load(std::memory_order_relaxed)) / 1e6, c.avg_mbps(), last ? "" : ",");
+  };
+  out += counter("source_read", ps.source_read, false);
+  out += counter("sort", ps.sort, false);
+  out += counter("source_write", ps.source_write, false);
+  out += counter("lod_read", ps.lod_read, false);
+  out += counter("lod_write", ps.lod_write, true);
+  out += "  }\n";
+  out += "}\n";
+
+  FILE *f = fopen(filename.c_str(), "wb");
+  if (!f)
+  {
+    if (error)
+    {
+      *error = dew_error_create();
+      const auto msg = fmt::format("cannot write conversion stats to {}", filename);
+      dew_error_set_info(*error, 1, msg.c_str(), msg.size());
+    }
+    return 0;
+  }
+  const bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
+  fclose(f);
+  return ok ? 1 : 0;
 }
 
 void dew_converter_set_upload_callbacks(dew_converter_t *converter, dew_converter_upload_callbacks_t callbacks, void *user_ptr)

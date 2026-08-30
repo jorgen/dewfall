@@ -140,6 +140,7 @@ public:
     _lod_complete_morton = m;
   }
 
+  perf_stats_t &stats() { return _perf_stats; }
   void iterate_workers();
 
   // Called from the STORAGE loop (the write completion callback). Only ever touches this tree's own

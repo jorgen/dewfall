@@ -232,7 +232,7 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
     auto &subset = job.collection.data[subset_index];
     std::unique_ptr<read_only_points_t> points;
     {
-      collapse_scoped_us_t timer(g_collapse_probe.read_us);
+      collapse_scoped_us_t timer(_storage.perf_stats().collapse_read_us);
       points = std::make_unique<read_only_points_t>(_storage, job.sources.at(subset.input_id).locations[0]);
     }
     if (points->error.code != 0)
@@ -272,10 +272,10 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
   // 2. Merge: subsets are internally sorted but interleave across chunks. Stable sort keeps the
   //    subset order as the tie-break for equal codes (duplicate points).
   {
-    collapse_scoped_us_t timer(g_collapse_probe.merge_us);
+    collapse_scoped_us_t timer(_storage.perf_stats().collapse_merge_us);
     std::stable_sort(entries.begin(), entries.end(), [](const merge_entry_t &a, const merge_entry_t &b) { return a.absolute < b.absolute; });
   }
-  g_collapse_probe.entries.fetch_add(entries.size(), std::memory_order_relaxed);
+  _storage.perf_stats().collapse_merge_entries.fetch_add(entries.size(), std::memory_order_relaxed);
 
   // 3. Destination format: the sorter's exact rule -- lod span of [min, max] picks the narrowest
   //    morton type whose truncation is lossless for every point in the unit.
@@ -320,7 +320,7 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
   attribute_buffers_t buffers;
   attribute_buffers_initialize(mapping.destination, buffers, uint32_t(indecies.size()), std::move(morton_buffer));
   {
-    collapse_scoped_us_t timer(g_collapse_probe.attrib_us);
+    collapse_scoped_us_t timer(_storage.perf_stats().collapse_attribute_us);
     quantize_attributres(_storage, job.sources, indecies, mapping, buffers);
   }
   attribute_buffers_adjust_buffers_to_size(mapping.destination, buffers, uint32_t(indecies.size()));
@@ -346,13 +346,13 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
       job.generated_locations = std::move(locations);
     finish();
   });
-  g_collapse_probe.jobs.fetch_add(1, std::memory_order_relaxed);
-  g_collapse_probe.total_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - collapse_worker_start).count()), std::memory_order_relaxed);
-  if (g_collapse_probe_on && (g_collapse_probe.jobs.load(std::memory_order_relaxed) % 500) == 0)
-    fmt::print(stderr, "\n[collapse] {} jobs, {:.1f}s in-worker | read {:.1f}s  merge {:.1f}s  attributes {:.1f}s | {} merge entries\n", g_collapse_probe.jobs.load(std::memory_order_relaxed),
-               double(g_collapse_probe.total_us.load(std::memory_order_relaxed)) / 1e6, double(g_collapse_probe.read_us.load(std::memory_order_relaxed)) / 1e6,
-               double(g_collapse_probe.merge_us.load(std::memory_order_relaxed)) / 1e6, double(g_collapse_probe.attrib_us.load(std::memory_order_relaxed)) / 1e6,
-               g_collapse_probe.entries.load(std::memory_order_relaxed));
+  _storage.perf_stats().collapse_jobs.fetch_add(1, std::memory_order_relaxed);
+  _storage.perf_stats().collapse_worker_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - collapse_worker_start).count()), std::memory_order_relaxed);
+  if (g_collapse_probe_on && (_storage.perf_stats().collapse_jobs.load(std::memory_order_relaxed) % 500) == 0)
+    fmt::print(stderr, "\n[collapse] {} jobs, {:.1f}s in-worker | read {:.1f}s  merge {:.1f}s  attributes {:.1f}s | {} merge entries\n", _storage.perf_stats().collapse_jobs.load(std::memory_order_relaxed),
+               double(_storage.perf_stats().collapse_worker_us.load(std::memory_order_relaxed)) / 1e6, double(_storage.perf_stats().collapse_read_us.load(std::memory_order_relaxed)) / 1e6,
+               double(_storage.perf_stats().collapse_merge_us.load(std::memory_order_relaxed)) / 1e6, double(_storage.perf_stats().collapse_attribute_us.load(std::memory_order_relaxed)) / 1e6,
+               _storage.perf_stats().collapse_merge_entries.load(std::memory_order_relaxed));
 }
 
 void tree_collapse_runner_t::handle_worker_done()

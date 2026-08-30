@@ -50,28 +50,6 @@ namespace
 // It exists because three plausible explanations for the low utilisation -- the level barrier, cache
 // pollution, and the reader loop -- were each argued from the code, each implemented or measured,
 // and each turned out not to be it. Counting settled in one run what reading had not in three.
-struct lod_probe_t
-{
-  std::atomic<uint64_t> workers{0};
-  std::atomic<uint64_t> attrib_map_us{0}; // get_lod_attribute_mapping: takes the attributes_configs mutex
-  std::atomic<uint64_t> morton_us{0};     // choosing the sample, EXCLUDING the child reads
-  std::atomic<uint64_t> attributes_us{0}; // scattering the children's attributes, EXCLUDING the reads
-  std::atomic<uint64_t> read_us{0};       // blob read + inline decompress + deserialize, blocking the pool thread
-  std::atomic<uint64_t> write_post_us{0}; // handing the result to the storage loop
-  std::atomic<uint64_t> total_us{0};
-
-  void reset()
-  {
-    workers.store(0, std::memory_order_relaxed);
-    attrib_map_us.store(0, std::memory_order_relaxed);
-    morton_us.store(0, std::memory_order_relaxed);
-    attributes_us.store(0, std::memory_order_relaxed);
-    read_us.store(0, std::memory_order_relaxed);
-    write_post_us.store(0, std::memory_order_relaxed);
-    total_us.store(0, std::memory_order_relaxed);
-  }
-};
-lod_probe_t g_lod_probe;
 const bool g_lod_probe_on = std::getenv("DEW_DEBUG_LOD") != nullptr;
 
 struct scoped_us_t
@@ -686,7 +664,7 @@ void quantize_attributres(storage_handler_t &cache, const child_storage_map_t &c
         continue;
       std::optional<read_attribute_t> attrib_read;
       {
-        scoped_us_t timer(g_lod_probe.read_us);
+        scoped_us_t timer(cache.perf_stats().lod_read_us);
         attrib_read.emplace(cache, storage_info.locations[attr_mapping.source_index], storage_info.retain_hot);
       }
       read_attribute_t &source_attrib_data = *attrib_read;
@@ -705,7 +683,7 @@ static void quantize_subset(storage_handler_t &cache, const points_subset_t &sub
 {
   std::optional<read_only_points_t> subset_read;
   {
-    scoped_us_t timer(g_lod_probe.read_us);
+    scoped_us_t timer(cache.perf_stats().lod_read_us);
     subset_read.emplace(cache, storage_info.locations[0], storage_info.retain_hot);
   }
   read_only_points_t &subset_data = *subset_read;
@@ -874,7 +852,7 @@ void lod_worker_t::work()
   auto lod_format = morton_type_from_lod(data.lod);
   const auto &generation_config = lod_generator.generation_tree_config();
   auto lod_attrib_mapping = [&] {
-    scoped_us_t timer(g_lod_probe.attrib_map_us);
+    scoped_us_t timer(lod_generator.stats().lod_attrib_map_us);
     return attributes_configs.get_lod_attribute_mapping(data.lod, attribute_ids.get(), attribute_ids.get() + data.child_storage_info.size(),
                                                         /*keep_original_order=*/false, generation_config.lod_all_attributes != 0);
   }();
@@ -886,7 +864,7 @@ void lod_worker_t::work()
 
   std::vector<std::pair<input_data_id_t, uint32_t>> indecies;
   {
-    scoped_us_t timer(g_lod_probe.morton_us);
+    scoped_us_t timer(lod_generator.stats().lod_sample_us);
     std::unique_ptr<uint8_t[]> morton_attribute_buffer;
     quantize_morton_remember_indecies(cache, data.node_min, data.child_data, data.child_storage_info, data.lod, random_offsets, generation_config.lod_adaptive_sampling != 0, morton_attribute_buffer, indecies, destination_header.morton_min,
                                       destination_header.morton_max);
@@ -894,7 +872,7 @@ void lod_worker_t::work()
   }
 
   {
-    scoped_us_t timer(g_lod_probe.attributes_us);
+    scoped_us_t timer(lod_generator.stats().lod_attribute_us);
     quantize_attributres(cache, data.child_storage_info, indecies, lod_attrib_mapping, buffers);
   }
 
@@ -912,7 +890,7 @@ void lod_worker_t::work()
   data.generated_point_count.data = uint32_t(indecies.size());
   data.generated_min = destination_header.morton_min;
   data.generated_max = destination_header.morton_max;
-  scoped_us_t write_timer(g_lod_probe.write_post_us);
+  scoped_us_t write_timer(lod_generator.stats().lod_write_post_us);
   cache.write(destination_header, lod_attrib_mapping.destination_id, std::move(buffers),
               [this](const storage_header_t &storageheader, attributes_id_t attrib_id, std::vector<storage_location_t> locations, const dew_error_t &error)
               {
@@ -922,8 +900,8 @@ void lod_worker_t::work()
                 this->data.generated_locations = std::move(locations);
                 this->lod_generator.add_worker_done(this->batch, this->tree_index);
               });
-  g_lod_probe.workers.fetch_add(1, std::memory_order_relaxed);
-  g_lod_probe.total_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - worker_start).count()), std::memory_order_relaxed);
+  lod_generator.stats().lod_workers.fetch_add(1, std::memory_order_relaxed);
+  lod_generator.stats().lod_worker_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - worker_start).count()), std::memory_order_relaxed);
 }
 
 static void get_storage_info(tree_registry_t &tree_cache, lod_node_worker_data_t &node)
@@ -1075,7 +1053,15 @@ tree_lod_generator_t::tree_lod_generator_t(vio::event_loop_t &loop, vio::thread_
 
 void tree_lod_generator_t::generate_lods(tree_id_t &tree_id, const morton::morton192_t &max)
 {
-  g_lod_probe.reset(); // per-pass, so in-worker CPU over pass wall is a real core count
+  // Per-pass, so in-worker CPU over pass wall is a real core count. The run-wide totals a stats file
+  // wants are accumulated separately below.
+  _perf_stats.lod_workers.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_read_us.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_sample_us.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_attribute_us.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_attrib_map_us.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_write_post_us.store(0, std::memory_order_relaxed);
+  _perf_stats.lod_worker_us.store(0, std::memory_order_relaxed);
   std::vector<lod_tree_worker_data_t> to_lod;
   lod_node_worker_data_t fake_parent;
   fake_parent.node_min = _tree_cache.data[tree_id.data]->morton_min;
@@ -1136,13 +1122,13 @@ void tree_lod_generator_t::iterate_workers()
     _perf_stats.lod_generation_time_us.store(lod_us, std::memory_order_relaxed);
     if (g_lod_probe_on)
     {
-      const auto workers = g_lod_probe.workers.load(std::memory_order_relaxed);
-      const auto total = g_lod_probe.total_us.load(std::memory_order_relaxed);
+      const auto workers = _perf_stats.lod_workers.load(std::memory_order_relaxed);
+      const auto total = _perf_stats.lod_worker_us.load(std::memory_order_relaxed);
       fmt::print(stderr, "\n[lod] collapse {:.1f}s + lod {:.1f}s wall | {} workers, {:.1f}s in-worker ({:.2f} cores) | read {:.1f}s  morton {:.1f}s  attributes {:.1f}s  attrib_map {:.1f}s  write_post {:.1f}s\n",
                  double(_perf_stats.collapse_time_us.load(std::memory_order_relaxed)) / 1e6, double(lod_us) / 1e6, workers, double(total) / 1e6,
-                 lod_us ? double(total) / double(lod_us) : 0.0, double(g_lod_probe.read_us.load(std::memory_order_relaxed)) / 1e6,
-                 double(g_lod_probe.morton_us.load(std::memory_order_relaxed)) / 1e6, double(g_lod_probe.attributes_us.load(std::memory_order_relaxed)) / 1e6,
-                 double(g_lod_probe.attrib_map_us.load(std::memory_order_relaxed)) / 1e6, double(g_lod_probe.write_post_us.load(std::memory_order_relaxed)) / 1e6);
+                 lod_us ? double(total) / double(lod_us) : 0.0, double(_perf_stats.lod_read_us.load(std::memory_order_relaxed)) / 1e6,
+                 double(_perf_stats.lod_sample_us.load(std::memory_order_relaxed)) / 1e6, double(_perf_stats.lod_attribute_us.load(std::memory_order_relaxed)) / 1e6,
+                 double(_perf_stats.lod_attrib_map_us.load(std::memory_order_relaxed)) / 1e6, double(_perf_stats.lod_write_post_us.load(std::memory_order_relaxed)) / 1e6);
     }
     _lod_done.post_event();
   }

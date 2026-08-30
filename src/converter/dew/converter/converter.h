@@ -270,6 +270,19 @@ DEW_CONVERTER_EXPORT void dew_converter_set_read_cache_bytes(struct dew_converte
  * size this generously or it holds almost nothing. */
 DEW_CONVERTER_EXPORT void dew_converter_set_decompressed_cache_bytes(struct dew_converter_t *converter, uint64_t max_bytes);
 
+/* Write a JSON record of THIS RUN to `path`: phase timings, collapse and LOD breakdowns, the
+ * three-way read split, decompression volume, and the io counters. Returns 1 on success.
+ *
+ * Distinct from dew info, which describes the finished DATASET. This describes the conversion, so
+ * two runs can be diffed -- which is the only way some of these problems are visible at all. The
+ * aggregate hit rate read 99.5% on a run spending most of its CPU re-inflating blobs, because a
+ * decoded-cache hit and a re-inflating hit counted the same; read.decoded_hits against
+ * read.recompressed_hits, and decompress.cores against wall, are what separate them.
+ *
+ * Call before dew_converter_destroy. */
+//= py.skip
+DEW_CONVERTER_EXPORT uint8_t dew_converter_write_stats(struct dew_converter_t *converter, const char *path, uint32_t path_size, struct dew_error_t **error);
+
 DEW_CONVERTER_EXPORT void dew_converter_set_upload_callbacks(struct dew_converter_t *converter, struct dew_converter_upload_callbacks_t callbacks, void *user_ptr);
 
 // Snapshot of upload/cache-tier state (approximate counters; safe any time). Returns false when the

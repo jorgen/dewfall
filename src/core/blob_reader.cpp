@@ -222,27 +222,32 @@ struct read_probe_t
 read_probe_t g_read_probe;
 const bool g_read_probe_on = std::getenv("DEW_DEBUG_READ") != nullptr;
 
-void read_probe_report()
+void read_probe_report(perf_stats_t &stats)
 {
   if (!g_read_probe_on)
     return;
-  const uint64_t d = g_read_probe.decompressed_hits.load(std::memory_order_relaxed);
-  const uint64_t c = g_read_probe.compressed_hits.load(std::memory_order_relaxed);
-  const uint64_t m = g_read_probe.misses.load(std::memory_order_relaxed);
+  const uint64_t d = stats.read_decoded_hits.load(std::memory_order_relaxed);
+  const uint64_t c = stats.read_recompressed_hits.load(std::memory_order_relaxed);
+  const uint64_t m = stats.read_misses.load(std::memory_order_relaxed);
   const uint64_t total = d + c + m;
   if (total == 0 || (total % 200000) != 0)
     return;
   fmt::print(stderr, "\n[read] {} reads: {:.1f}% decoded-hit, {:.1f}% recompressed-hit, {:.1f}% miss | {:.1f}s decompressing {:.2f} GB\n", total, 100.0 * double(d) / double(total),
-             100.0 * double(c) / double(total), 100.0 * double(m) / double(total), double(g_read_probe.decompress_us.load(std::memory_order_relaxed)) / 1e6,
-             double(g_read_probe.decompressed_bytes.load(std::memory_order_relaxed)) / 1e9);
+             100.0 * double(c) / double(total), 100.0 * double(m) / double(total), double(stats.decompress_us.load(std::memory_order_relaxed)) / 1e6,
+             double(stats.decompress_input_bytes.load(std::memory_order_relaxed)) / 1e9);
 }
 
 struct decompress_timer_t
 {
+  perf_stats_t &stats;
   std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+  explicit decompress_timer_t(perf_stats_t &s)
+    : stats(s)
+  {
+  }
   ~decompress_timer_t()
   {
-    g_read_probe.decompress_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    stats.decompress_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
   }
 };
 } // namespace
@@ -289,8 +294,8 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
     if (decompressed_hit.has_value())
     {
       _perf_stats.cache_hits.fetch_add(1, std::memory_order_relaxed);
-      g_read_probe.decompressed_hits.fetch_add(1, std::memory_order_relaxed);
-      read_probe_report();
+      _perf_stats.read_decoded_hits.fetch_add(1, std::memory_order_relaxed);
+      read_probe_report(_perf_stats);
       ret->buffer = decompressed_hit->data;
       ret->buffer_info.data = ret->buffer.get();
       ret->buffer_info.size = decompressed_hit->size;
@@ -339,10 +344,10 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
 #endif
     if (compressed)
     {
-      g_read_probe.compressed_hits.fetch_add(1, std::memory_order_relaxed);
-      g_read_probe.decompressed_bytes.fetch_add(cv.compressed_size, std::memory_order_relaxed);
-      read_probe_report();
-      decompress_timer_t decompress_timer;
+      _perf_stats.read_recompressed_hits.fetch_add(1, std::memory_order_relaxed);
+      _perf_stats.decompress_input_bytes.fetch_add(cv.compressed_size, std::memory_order_relaxed);
+      read_probe_report(_perf_stats);
+      decompress_timer_t decompress_timer(_perf_stats);
       auto decompressed = decompress_any(cv.compressed_data.get(), cv.compressed_size);
       if (decompressed.error.code == 0)
       {
@@ -433,9 +438,9 @@ vio::task_t<void> blob_reader_t::do_read_request(std::shared_ptr<read_request_t>
     // Decompress if needed -- unless this is a raw read (the decode worker decompresses off-thread).
     if (!read_request->raw && read_request->buffer && has_compression_magic(read_request->buffer.get(), read_request->buffer_info.size))
     {
-      g_read_probe.misses.fetch_add(1, std::memory_order_relaxed);
-      read_probe_report();
-      decompress_timer_t decompress_timer;
+      _perf_stats.read_misses.fetch_add(1, std::memory_order_relaxed);
+      read_probe_report(_perf_stats);
+      decompress_timer_t decompress_timer(_perf_stats);
       auto decompressed = decompress_any(read_request->buffer.get(), read_request->buffer_info.size);
       if (decompressed.error.code == 0)
       {

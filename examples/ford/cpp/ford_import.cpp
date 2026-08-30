@@ -311,6 +311,10 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
   const bool have_stats = dew_converter_get_compression_stats(converter, &stats);
   dew_converter_perf_stats_t perf{};
   const bool have_perf = dew_converter_get_live_perf_stats(converter, &perf); // live, not the deserialized index stats
+  // A sidecar record of the run, next to the dataset. dew info describes the dataset; this describes
+  // how it got made, so two runs can be diffed.
+  const std::string stats_path = output + ".stats.json";
+  const bool wrote_stats = dew_converter_write_stats(converter, stats_path.c_str(), uint32_t(stats_path.size()), nullptr) == 1;
   dew_converter_destroy(converter);
 
   if (failed)
@@ -330,6 +334,8 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
     }
     fmt::print("    {:<12} {:9.2f} MB -> {:8.2f} MB\n", "total", double(raw) / 1e6, double(packed) / 1e6);
   }
+  if (wrote_stats)
+    fmt::print("  run statistics: {}\n", stats_path);
   if (have_perf)
   {
     const uint64_t looks = perf.cache_hits + perf.cache_misses;

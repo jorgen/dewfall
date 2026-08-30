@@ -175,6 +175,9 @@ public:
 
   const compression_stats_t &get_compression_stats() const { return _compression_stats; }
   const perf_stats_t::deserialized_perf_stats_t &get_deserialized_perf_stats() const { return _deserialized_perf_stats; }
+  // The live counters for this run. Handed out so phases that already hold a storage_handler (leaf
+  // collapse) can record into the same record rather than keeping their own file-static tallies.
+  perf_stats_t &perf_stats() { return _perf_stats; }
 
 private:
   void handle_write_events(
