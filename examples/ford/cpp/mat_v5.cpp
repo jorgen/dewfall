@@ -437,8 +437,23 @@ bool inflate_zlib(const uint8_t *data, size_t size, size_t size_hint, std::vecto
     }
     if (!output_was_full)
     {
-      error = fmt::format("truncated or corrupt zlib stream: inflate returned {} ({}) after {} bytes with {} bytes of output room to spare", rc, message, produced, capacity - produced);
-      return false;
+      // The input ran out before the stream ended. That is NOT the same as unusable data, and
+      // rejecting it here was wrong: Scan0111.mat (and four others in the release) lose only the
+      // deflate stream's terminating block, while every byte the MATLAB payload declares is
+      // present -- 0111 inflates to 7028736 bytes for a top-level element that declares exactly
+      // 7028728 bytes of content. scipy.io.loadmat reads all five without complaint, which is how
+      // the discrepancy surfaced: the Python importer produced a scan the C++ one had dropped.
+      //
+      // So hand back what did inflate and let the element walk judge it. That parse already checks
+      // every declared size against what is actually there, so a stream truncated far enough to
+      // matter fails a few frames later with a precise message instead of a blanket one here.
+      if (produced == 0)
+      {
+        error = fmt::format("truncated zlib stream produced nothing: inflate returned {} ({})", rc, message);
+        return false;
+      }
+      out.resize(produced);
+      return true;
     }
     if (rc != Z_OK && rc != Z_BUF_ERROR)
     {
