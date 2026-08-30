@@ -39,7 +39,7 @@ ERROR_ARG_CALLER_OWNED = "error_arg_caller_owned"  # caller passes a dew_error_t
 # Updated deliberately whenever the public API grows; a mismatch is a loud
 # warning from parse_headers.py and an assertion in test_ir.py.
 EXPECTED_COUNTS = {
-    "functions": 151,
+    "functions": 159,
     "opaque_types": 19,
     "enums": 21,
     "structs": 28,

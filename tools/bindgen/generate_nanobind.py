@@ -47,6 +47,10 @@ _CUSTOM_CLASS_SNIPPETS = {
         "dewpy::bind_set_file_converter_callbacks(cls, m);",
     ),
     "dew_laszip_callbacks": ("Converter", "dewpy::bind_use_laszip_callbacks(cls);"),
+    # add_data_for_attribute is py.skip (a bare const void* is not a safe Python parameter); the shim
+    # binds a numpy-aware version. It takes over add_attribute too, to record the declared type that
+    # the value-array size is then checked against.
+    "dew_converter_add_attribute": ("Converter", "dewpy::bind_amend(cls);"),
     # The C request lifecycle (opaque handle, borrowed buffers, explicit release) is not what a
     # Python caller wants; Dataset.query_box() runs it end to end and hands back NumPy arrays.
     "dew_dataset_request_region": ("Dataset", "dewpy::bind_query_box(cls);\n  dewpy::bind_query_submit<PyRequest>(cls);"),
@@ -906,6 +910,7 @@ class Emitter:
         parts.append("} // namespace")
         parts.append("")
         parts.append('#include "custom/file_convert_callbacks.h"')
+        parts.append('#include "custom/amend.h"')
         parts.append('#include "custom/query.h"')
         parts.append('#include "custom/query_async.h"')
         parts.append("")

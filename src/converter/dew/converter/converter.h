@@ -280,7 +280,6 @@ DEW_CONVERTER_EXPORT void dew_converter_set_decompressed_cache_bytes(struct dew_
  * read.recompressed_hits, and decompress.cores against wall, are what separate them.
  *
  * Call before dew_converter_destroy. */
-//= py.skip
 DEW_CONVERTER_EXPORT uint8_t dew_converter_write_stats(struct dew_converter_t *converter, const char *path, uint32_t path_size, struct dew_error_t **error);
 
 DEW_CONVERTER_EXPORT void dew_converter_set_upload_callbacks(struct dew_converter_t *converter, struct dew_converter_upload_callbacks_t callbacks, void *user_ptr);
@@ -404,6 +403,7 @@ DEW_CONVERTER_EXPORT uint8_t dew_converter_add_attribute(struct dew_converter_t 
  *
  * Skipped by the Python bindings: `values` has no static element type -- it follows whatever
  * add_attribute declared -- so it wants a NumPy-aware wrapper rather than a generated pointer. */
+//= arrays: keys[count], values[count]
 //= py.skip
 DEW_CONVERTER_EXPORT uint8_t dew_converter_add_data_for_attribute(struct dew_converter_t *converter, const char *name, uint32_t name_size, const uint64_t *keys, const void *values, uint64_t count);
 
