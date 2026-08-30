@@ -825,6 +825,14 @@ void lod_worker_t::work()
   destination_header.point_count = uint32_t(indecies.size());
   destination_header.point_format = {lod_format, dew_components_1};
   destination_header.lod_span = data.lod;
+  // PUBLISHED BEFORE THE WRITE IS POSTED, not after. cache.write's completion callback runs on the
+  // storage loop and calls add_worker_done, which wakes the tree loop to run adjust_tree_after_lod --
+  // and that reads exactly these three fields. Setting them after the post left nothing ordering the
+  // pool thread's stores against the tree loop's reads; only the latency of compress-allocate-write
+  // kept the window from ever being observed.
+  data.generated_point_count.data = uint32_t(indecies.size());
+  data.generated_min = destination_header.morton_min;
+  data.generated_max = destination_header.morton_max;
   cache.write(destination_header, lod_attrib_mapping.destination_id, std::move(buffers),
               [this](const storage_header_t &storageheader, attributes_id_t attrib_id, std::vector<storage_location_t> locations, const dew_error_t &error)
               {
@@ -834,9 +842,6 @@ void lod_worker_t::work()
                 this->data.generated_locations = std::move(locations);
                 this->lod_generator.add_worker_done(this->batch);
               });
-  data.generated_point_count.data = uint32_t(indecies.size());
-  data.generated_min = destination_header.morton_min;
-  data.generated_max = destination_header.morton_max;
 }
 
 static void get_storage_info(tree_registry_t &tree_cache, lod_node_worker_data_t &node)
