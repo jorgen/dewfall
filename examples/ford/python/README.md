@@ -54,6 +54,13 @@ true lower bound: too low only slows the watermark, too high silently *drops* po
 **`set_lod_all_attributes(1)`.** The default LOD keep-list is rgb/intensity/classification, so
 without it `scan_key` would not survive LOD and only leaf nodes could ever be coloured.
 
+**Do not call BLAS from the callbacks.** The converter runs `init` on several worker threads at
+once. Writing the pose transform as the obvious `xyz @ r.T` sends an (N,3)×(3,3) product to
+OpenBLAS, whose threading layer is not safe under that — it faulted inside its own critical section
+about one run in eight, with a native stack and no Python frame. `world_points` multiplies the nine
+terms out elementwise instead, which is both crash-free and marginally faster: a 3×3 rotation is
+far below the size where BLAS earns its dispatch.
+
 ## What it costs
 
 The converter calls `pre_init`/`init`/`convert_data` on its own worker threads, and each takes the

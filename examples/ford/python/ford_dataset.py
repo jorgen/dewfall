@@ -181,8 +181,21 @@ def world_points(scan):
 
     SCAN.XYZ is in the VEHICLE frame: every scan's points sit within a couple of metres of the
     origin until its own pose places them, so skipping this piles a 450 m loop into one heap.
+
+    Written out elementwise rather than as `scan.xyz @ r.T`, which looks better and CRASHES. The
+    matmul dispatches an (N,3) x (3,3) product to OpenBLAS, and the converter calls this from
+    several of its worker threads at once; OpenBLAS's threading layer is not safe under that and
+    faults inside its own critical section about one run in eight. Nothing is lost by avoiding it:
+    a 3x3 rotation is nine multiplies per point, well under the threshold where BLAS pays for its
+    own dispatch, and this version measures slightly faster single-threaded as well.
     """
-    return scan.xyz @ rotation_from_pose(scan.pose).T + scan.pose[:3]
+    r = rotation_from_pose(scan.pose)
+    x, y, z = scan.xyz[:, 0], scan.xyz[:, 1], scan.xyz[:, 2]
+    world = np.empty_like(scan.xyz)
+    world[:, 0] = x * r[0, 0] + y * r[0, 1] + z * r[0, 2] + scan.pose[0]
+    world[:, 1] = x * r[1, 0] + y * r[1, 1] + z * r[1, 2] + scan.pose[1]
+    world[:, 2] = x * r[2, 0] + y * r[2, 1] + z * r[2, 2] + scan.pose[2]
+    return world
 
 
 def read_ppm(path):
