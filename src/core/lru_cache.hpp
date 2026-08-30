@@ -36,7 +36,11 @@ public:
   {
   }
 
-  std::optional<Value> get(const Key &key)
+  // `promote` false leaves the entry where it is instead of moving it to the front. For a read that
+  // consumes a blob WHOLE there is no reason to keep it hot: whoever wanted it has it. A read that
+  // takes only a SUBSET is different -- the other subsets belong to other nodes, which will be back
+  // for the same blob -- so those promote as usual.
+  std::optional<Value> get(const Key &key, bool promote = true)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _map.find(key);
@@ -46,11 +50,15 @@ public:
       return std::nullopt;
     }
     _hit_count++;
-    _lru_list.splice(_lru_list.begin(), _lru_list, it->second);
+    if (promote)
+      _lru_list.splice(_lru_list.begin(), _lru_list, it->second);
     return it->second->value;
   }
 
-  void put(const Key &key, Value value, uint64_t size)
+  // `hot` false inserts at the BACK -- first out rather than last. The miss path is what evicts, so
+  // this is the half that matters for a blob read once and never again: without it every such read
+  // pushes a genuinely reused blob one step closer to eviction.
+  void put(const Key &key, Value value, uint64_t size, bool hot = true)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _map.find(key);
@@ -60,12 +68,16 @@ public:
       it->second->value = std::move(value);
       it->second->size = size;
       _current_bytes += size;
-      _lru_list.splice(_lru_list.begin(), _lru_list, it->second);
+      if (hot)
+        _lru_list.splice(_lru_list.begin(), _lru_list, it->second);
     }
     else
     {
-      _lru_list.push_front({key, std::move(value), size});
-      _map[key] = _lru_list.begin();
+      if (hot)
+        _lru_list.push_front({key, std::move(value), size});
+      else
+        _lru_list.push_back({key, std::move(value), size});
+      _map[key] = hot ? _lru_list.begin() : std::prev(_lru_list.end());
       _current_bytes += size;
     }
     evict();

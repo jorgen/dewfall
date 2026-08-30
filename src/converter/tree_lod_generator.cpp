@@ -639,7 +639,10 @@ template <typename T, size_t N>
 static void quantize_subset(storage_handler_t &cache, const points_subset_t &subset, const lod_child_storage_info_t &storage_info, int lod, const std::vector<float> &random_offsets,
                             std::vector<morton_to_lod_t<T, N>> &morton_to_lod)
 {
-  read_only_points_t subset_data(cache, storage_info.locations[0]);
+  // A count of 0 means "the whole unit" (see below), i.e. this node is the blob's only reader, so it
+  // is not worth keeping hot. A real subset means other nodes hold the other subsets of this same
+  // blob and will be back for it.
+  read_only_points_t subset_data(cache, storage_info.locations[0], /*retain_hot=*/subset.count.data != uint32_t(0));
   // Failed read: conversion is flagged (storage error pipe); contribute nothing rather than crash.
   if (subset_data.error.code != 0)
     return;

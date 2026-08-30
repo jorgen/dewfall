@@ -95,6 +95,7 @@ struct read_request_t
 
   bool raw = false; // when set, read() returns the COMPRESSED bytes as-is (no decompress) -- used by the
                     // wasm decode-worker path, which decompresses off the main thread.
+  bool retain_hot = true; // see read_options_t::retain_hot; carried here because the cold path inserts later
   bool _done = false;
   std::atomic_bool _cancelled{false};
   std::mutex _mutex;
@@ -160,6 +161,13 @@ struct read_options_t
   bool decompress_inline = false;
   // See read_request_t::_on_complete.
   std::function<void(read_request_t &)> on_complete;
+  // Whether this read leaves the blob worth keeping hot. LAST, so aggregate initialisers that list
+  // only the first three members keep compiling.
+  //
+  // A node that consumes a unit WHOLE is its only reader -- an LOD child, say -- so the entry is dead
+  // the moment the read returns. A node that takes a SUBSET is one of many readers of the same blob
+  // (a chunk unit is referenced by every leaf it spans), and those are what a cache exists for.
+  bool retain_hot = true;
 };
 
 class blob_reader_t

@@ -303,6 +303,8 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
 
   dew_converter_stats_t stats{};
   const bool have_stats = dew_converter_get_compression_stats(converter, &stats);
+  dew_converter_perf_stats_t perf{};
+  const bool have_perf = dew_converter_get_live_perf_stats(converter, &perf); // live, not the deserialized index stats
   dew_converter_destroy(converter);
 
   if (failed)
@@ -321,6 +323,11 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
       fmt::print("    {:<12} {:9.2f} MB -> {:8.2f} MB\n", stats.attributes[i].name, double(stats.attributes[i].uncompressed_bytes) / 1e6, double(stats.attributes[i].compressed_bytes) / 1e6);
     }
     fmt::print("    {:<12} {:9.2f} MB -> {:8.2f} MB\n", "total", double(raw) / 1e6, double(packed) / 1e6);
+  }
+  if (have_perf)
+  {
+    const uint64_t looks = perf.cache_hits + perf.cache_misses;
+    fmt::print("  blob cache: {} hits / {} lookups ({:.1f}%)\n", perf.cache_hits, looks, looks ? 100.0 * double(perf.cache_hits) / double(looks) : 0.0);
   }
   fmt::print("\ninspect it with:  dew info {}\n", output);
   return 0;

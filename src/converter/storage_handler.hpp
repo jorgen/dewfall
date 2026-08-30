@@ -227,9 +227,11 @@ private:
 
 struct read_only_points_t
 {
-  read_only_points_t(storage_handler_t &storage_handler, storage_location_t a_location)
+  // retain_hot: false when this read consumes the unit WHOLE (the caller is its only reader), true
+  // when it takes a subset (other nodes will read the other subsets of the same blob).
+  read_only_points_t(storage_handler_t &storage_handler, storage_location_t a_location, bool retain_hot = true)
     : location(a_location)
-    , read_request(storage_handler.read(location, /*raw=*/false, /*decompress_inline=*/true))
+    , read_request(storage_handler.read(location, read_options_t{/*raw=*/false, /*decompress_inline=*/true, {}, retain_hot}))
   {
     read_request->wait_for_read();
     // A failed read leaves data/header empty; callers MUST check `error` before dereferencing.

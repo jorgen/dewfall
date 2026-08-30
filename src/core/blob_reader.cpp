@@ -226,6 +226,7 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
   const bool decompress_inline = options.decompress_inline;
   auto ret = std::make_shared<read_request_t>();
   ret->raw = raw;
+  ret->retain_hot = options.retain_hot;
   // Installed BEFORE any completion path can run: the three cache-hit branches below finish the
   // request before read() returns, so a hook attached afterwards would never fire.
   ret->_on_complete = std::move(options.on_complete);
@@ -244,7 +245,7 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
       return ret;
     }
   }
-  auto cached = _read_cache.get(key);
+  auto cached = _read_cache.get(key, options.retain_hot);
   if (cached.has_value())
   {
     _perf_stats.cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -292,7 +293,7 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
         ret->buffer_info.data = ret->buffer.get();
         ret->buffer_info.size = decompressed.size;
         if (decompress_inline)
-          _decompressed_cache.put(key, decompressed_cache_value_t{ret->buffer, ret->buffer_info.size}, ret->buffer_info.size);
+          _decompressed_cache.put(key, decompressed_cache_value_t{ret->buffer, ret->buffer_info.size}, ret->buffer_info.size, ret->retain_hot);
       }
       else
       {
@@ -355,7 +356,7 @@ vio::task_t<void> blob_reader_t::do_read_request(std::shared_ptr<read_request_t>
   {
     // Cache the raw compressed data before decompression
     cache_key_t key{location.file_id, location.offset};
-    _read_cache.put(key, cache_value_t{buffer, location.size}, location.size);
+    _read_cache.put(key, cache_value_t{buffer, location.size}, location.size, read_request->retain_hot);
 
     // If cancelled, skip decompression but keep cached compressed data
     if (read_request->is_cancelled())
