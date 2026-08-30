@@ -45,6 +45,26 @@ struct dew_converter_header_t
 
 struct dew_converter_file_pre_init_info_t
 {
+  /* The file's minimum corner in world coordinates, and whether it is known (found_aabb_min).
+   *
+   * UNLIKE found_point_count AND found_scale, WHICH ARE HINTS, THIS ONE IS LOAD-BEARING. The
+   * converter dispatches inputs in rising min-morton order and derives the done-morton watermark
+   * from it; everything strictly below that watermark is final, which is what lets LOD passes
+   * conclude, subtrees finalize, leaf collapse retire its chunks and checkpoints commit.
+   *
+   * Omitting it is SAFE but not cheap: a file with no min gets input_order 0, the watermark stays at
+   * 0 until every input has finished, and all of the collapse and LOD work defers to a single
+   * terminal pass. On a 300-million-point conversion that was the difference between finishing
+   * incrementally and running for over an hour without producing a readable dataset.
+   *
+   * It cannot be recovered later. dew_converter_header_t's min from init() would be a valid bound,
+   * but by then dispatch order is already fixed, and the watermark's prefix logic is only meaningful
+   * if inputs were dispatched in rising min-morton order in the first place.
+   *
+   * It must be a TRUE lower bound on every point of the file, on every axis -- morton is monotone
+   * per coordinate, so the min corner's code is <= that of any point in the box. Too low merely
+   * slows the watermark; too high silently drops points below it. When the exact min is unknown, an
+   * estimate padded generously is the right answer. */
   double aabb_min[3];
   uint64_t approximate_point_count;
   uint64_t input_file_size_bytes;

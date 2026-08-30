@@ -130,6 +130,7 @@ public:
   }
 
   // Source-scale adoption state (first pre-init batch may set the octree scale from the input files).
+  bool _warned_missing_aabb_min = false;
   bool _tree_scale_explicit = false;
   double _source_scale_adopted = 0.0;
 

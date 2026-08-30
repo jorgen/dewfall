@@ -113,11 +113,39 @@ uint32_t scan_id_from_path(const std::string &path)
 
 namespace
 {
-dew_converter_file_pre_init_info_t ford_pre_init(const char *, size_t, dew_error_t **)
+dew_converter_file_pre_init_info_t ford_pre_init(const char *filename, size_t filename_size, dew_error_t **)
 {
   dew_converter_file_pre_init_info_t info{};
   info.approximate_point_count = k_approximate_points_per_scan;
   info.found_point_count = 1;
+
+  // REPORTING aabb_min IS NOT OPTIONAL, and leaving it out is not merely a missed optimisation.
+  //
+  // The converter dispatches inputs in rising min-morton order and derives the done-morton watermark
+  // from it -- everything strictly below the watermark is final, which is what lets LOD passes
+  // conclude, subtrees finalize, leaf collapse retire its chunks and checkpoints commit. The registry
+  // is explicit about the alternative (input_data_source_registry.cpp): "A file without a found
+  // pre-init min has input_order 0 -> boundary 0 -> no progress until it's done: conservative."
+  //
+  // With 3812 inputs and no min, the watermark sat at zero for the whole conversion. Nothing was ever
+  // final, so all of the collapse and LOD work piled into a single terminal pass: 190 s of ingest
+  // followed by 62 minutes of one-and-a-half cores, 11 GB of resident memory, and not one checkpoint.
+  //
+  // The min corner has to be a TRUE lower bound on every point of the scan, on every axis, or the
+  // watermark overclaims and points below it are dropped. The scan's own extent reaches about 115 m
+  // from the sensor, so the pose minus the (larger) bounds padding is comfortably safe.
+  scan_t scan;
+  std::string message;
+  if (scan_read(std::string(filename, filename_size), scan, message))
+  {
+    for (int i = 0; i < 3; i++)
+      info.aabb_min[i] = scan.pose[i] - k_bounds_padding;
+    info.found_aabb_min = 1;
+    info.approximate_point_count = scan.point_count;
+    // The scan is decoded a second time in init, where the points are actually wanted. That is a
+    // deliberate trade: pre_init runs on the converter's thread pool, so this pass is parallel and
+    // costs wall-clock roughly once, and it buys a watermark that advances.
+  }
   // 16 bytes on the wire (i32x3 + u32) but reported higher, because this number is what the
   // converter's 1 GB read/sort budget divides by to decide how many inputs to have in flight. The
   // true cost of an input here includes decoding a 7 MB MATLAB payload, and letting 800 of those
@@ -248,11 +276,19 @@ bool ford_trajectory_bounds(const dataset_t &dataset, size_t stride, double (&wo
   sampled = 0;
   if (stride == 0)
     stride = 1;
+  size_t unreadable = 0;
   for (size_t i = 0; i < dataset.scan_paths.size(); i += stride)
   {
     scan_t scan;
     if (!scan_read(dataset.scan_paths[i], scan, error))
-      return false;
+    {
+      // SKIPPED, not fatal. The Ford release contains several truncated scans, and one of them
+      // landing on the sampling stride must not stop the import before it starts -- which is exactly
+      // what it did the first time this was run over the whole dataset. The bounds only have to
+      // BRACKET the data, and the padding below already covers far more than one missing pose.
+      unreadable++;
+      continue;
+    }
     for (int a = 0; a < 3; a++)
     {
       world_min[a] = std::fmin(world_min[a], scan.pose[a]);
@@ -262,9 +298,10 @@ bool ford_trajectory_bounds(const dataset_t &dataset, size_t stride, double (&wo
   }
   if (!sampled)
   {
-    error = "no scans sampled for the trajectory";
+    error = fmt::format("no scans could be read for the trajectory ({} unreadable)", unreadable);
     return false;
   }
+  error.clear();
   // The box has to BRACKET the data, and the data is the sensor's reach around a trajectory we only
   // sampled. The padding covers both: the velodyne's ~110 m range, plus however far the vehicle
   // travelled between two samples. Being generous costs a little octree depth and nothing else;

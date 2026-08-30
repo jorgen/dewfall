@@ -308,6 +308,19 @@ void processor_t::finalize()
 
 bool processor_t::declare_attribute(const std::string &name, const std::string &key_attribute, dew_type_t type, dew_components_t components)
 {
+  // Set BEFORE declare, because declare is what opens the spill file. Doing it in
+  // commit_attributes -- where the pass that reads the spill lives -- is too late by the whole
+  // add_data phase, and the amend silently falls back to the system temp directory. That put a
+  // 3.3 GB spill on a system drive with 24 GB free while the dataset sat on a 3 TB volume.
+  //
+  // Beside the dataset, because that is where the caller already provisioned space for data of this
+  // size. A remote url has no local directory to speak of, so those keep the temp fallback.
+  {
+    const auto slash = _url.find_last_of("/\\");
+    const bool looks_remote = _url.find("://") != std::string::npos;
+    if (!looks_remote && slash != std::string::npos)
+      _attribute_amend.set_spill_directory(_url.substr(0, slash));
+  }
   std::string message;
   if (!_tree_handler.is_mutable())
   {
@@ -346,16 +359,6 @@ void processor_t::commit_attributes()
     error.msg = "attributes can only be committed to a mutable dataset";
     handle_storage_error(std::move(error));
     return;
-  }
-
-  // 0. Spill beside the dataset when it is a local path. The amend streams the caller's values to
-  //    disk rather than holding them, and the dataset's own directory is where the caller already
-  //    provisioned space for data of this size.
-  {
-    const auto slash = _url.find_last_of("/\\");
-    const bool looks_remote = _url.find("://") != std::string::npos;
-    if (!looks_remote && slash != std::string::npos)
-      _attribute_amend.set_spill_directory(_url.substr(0, slash));
   }
 
   // 1. Land everything in flight. The amend snapshots each unit's storage locations and then writes
@@ -584,6 +587,20 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
     }
     else
     {
+      // WARN ONCE if a file arrives with no minimum corner. It is legal -- the watermark just stays
+      // conservative -- but the cost is invisible and enormous: without it every collapse and LOD
+      // pass defers to a single terminal one, which on a 300M-point conversion is the difference
+      // between checkpointing as it goes and running for over an hour with nothing readable on disk.
+      // The field sits beside found_point_count and found_scale, which really are only hints, so
+      // nothing about the struct suggests this one decides the shape of the whole conversion.
+      if (!r.pre_init_result.found_min && !_warned_missing_aabb_min)
+      {
+        _warned_missing_aabb_min = true;
+        if (_runtime_callbacks.warning)
+          _runtime_callbacks.warning(_runtime_callback_user_ptr,
+                                     "input reported no aabb_min from pre_init: the done-morton watermark cannot advance, so all LOD and collapse work will "
+                                     "defer to a single terminal pass. See dew_converter_file_pre_init_info_t::aabb_min.");
+      }
       _input_data_source_registry.register_pre_init_result(_tree_handler.tree_config(), r.pre_init_result.id, r.pre_init_result.found_min, r.pre_init_result.min,
                                                            r.pre_init_result.approximate_point_count, r.pre_init_result.approximate_point_size_bytes, r.pre_init_result.input_file_size_bytes);
       _storage_handler.register_input_file_size(r.pre_init_result.id.data, r.pre_init_result.input_file_size_bytes);
