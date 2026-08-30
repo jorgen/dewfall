@@ -66,23 +66,36 @@ free_blob_manager_t::offset_t free_blob_manager_t::register_blob(blob_size_t siz
 
         if (spillover_from_last_page.data > 0)
         {
-          auto spillover_page_count = size.data / FREE_BLOB_MANAGER_PAGE_SIZE;
-          auto remove_back_free_section_it = page_it - 1;
-          for (uint64_t spillover_page_index = 0; spillover_page_index < spillover_page_count; spillover_page_index++)
+          // CONSUME THE TAIL WE JUST HANDED OUT. return_offset starts spillover_from_last_page bytes
+          // BEFORE this section, inside the trailing free sections of the preceding pages -- so those
+          // sections are now occupied and must leave the free list.
+          //
+          // This used to iterate `size / FREE_BLOB_MANAGER_PAGE_SIZE` times, which is ZERO for any
+          // blob smaller than a page. The tail stayed free, the next request was handed the same
+          // offset, and two blobs ended up on top of each other. It is silent: nothing fails until
+          // something reads the blob that was overwritten.
+          //
+          // Walk back by PAGE NUMBER rather than by iterator: the current page's entry may already
+          // have been erased just above, and erasing from an unordered_dense map invalidates
+          // iterators.
+          uint64_t remaining = spillover_from_last_page.data;
+          page_t previous = page_number;
+          while (remaining > 0 && previous > 0)
           {
-            if (remove_back_free_section_it->second.size() == 1)
-            {
-              remove_back_free_section_it = _free_sections_by_page.erase(remove_back_free_section_it);
-            }
+            previous--;
+            auto previous_it = _free_sections_by_page.find(previous);
+            if (previous_it == _free_sections_by_page.end() || previous_it->second.empty())
+              break;
+            const uint64_t contributed = previous_it->second.back().size.data;
+            if (contributed > remaining)
+              break; // not a whole trailing section: it did not contribute to this spillover
+            remaining -= contributed;
+            if (previous_it->second.size() == 1)
+              _free_sections_by_page.erase(previous_it);
             else
-            {
-              remove_back_free_section_it->second.pop_back();
-            }
-            if (remove_back_free_section_it != _free_sections_by_page.begin())
-            {
-              --remove_back_free_section_it;
-            }
+              previous_it->second.pop_back();
           }
+          assert(remaining == 0 && "spillover consumed free space it could not account for");
         }
         return return_offset;
       }

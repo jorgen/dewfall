@@ -454,6 +454,8 @@ vio::task_t<void> storage_handler_t::do_write_attributes(std::vector<attribute_w
 
     auto results = co_await vio::schedule_work(_event_loop, _thread_pool, std::move(work_items));
 
+    std::vector<compressed_write_data_t> compressed;
+    compressed.reserve(results.size());
     for (auto &result : results)
     {
       if (!result.has_value())
@@ -472,14 +474,19 @@ vio::task_t<void> storage_handler_t::do_write_attributes(std::vector<attribute_w
         compression_flags = hdr.flags;
       }
       _compression_stats.accumulate(wd.attribute_name, wd.format, wd.uncompressed_size, wd.size, wd.min_value, wd.max_value, compression_flags, wd.is_lod);
-
-      auto &location = locations[size_t(wd.buffer_index)];
-      {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _reader.backend()->allocate_blob(wd.size, storage_backend_t::blob_kind_t::data, location);
-      }
-      co_await do_write(wd.data, location);
+      compressed.push_back(std::move(wd));
     }
+
+    // ALLOCATE THE WHOLE BATCH FIRST, THEN WRITE. Allocating inside the write loop puts a co_await
+    // -- and therefore an arbitrary amount of other storage-loop work, including a checkpoint --
+    // between consecutive allocations. The whole-unit path gets away with it because it allocates a
+    // handful of buffers; an amend batch allocates thousands, and the allocator handed out the same
+    // range twice. Measured on a 300-scan Ford import: 0 overlapping blobs before the amend, 13
+    // after, every one of them between two blobs the amend had just written.
+    for (auto &wd : compressed)
+      _reader.backend()->allocate_blob(wd.size, storage_backend_t::blob_kind_t::data, locations[size_t(wd.buffer_index)]);
+    for (auto &wd : compressed)
+      co_await do_write(wd.data, locations[size_t(wd.buffer_index)]);
   }
   else
   {

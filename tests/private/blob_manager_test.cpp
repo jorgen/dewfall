@@ -540,3 +540,43 @@ TEST_CASE("Blob manager handles offsets beyond 4 GB without 32-bit overflow")
   auto reused = manager.register_blob({page});
   REQUIRE(reused.data == high.data);
 }
+
+TEST_CASE("free_blob_manager: a spillover allocation must consume the previous page's tail")
+{
+  // THE SPILLOVER LEAK. register_blob can satisfy a request from the tail of one page plus the head
+  // of the next, and returns an offset that starts inside that tail. It then removes the tail from
+  // the free list only if the blob spans at least one WHOLE page:
+  //
+  //     auto spillover_page_count = size.data / FREE_BLOB_MANAGER_PAGE_SIZE;   // 0 for any small blob
+  //
+  // For anything smaller than a page that is zero, so the tail stays free and is handed out again --
+  // on top of the blob that already occupies it. Found as silent data corruption on a 300-scan Ford
+  // import: a unit's position blob had been overwritten by a later allocation, and 15 pairs of
+  // blobs overlapped in a dataset where every blob should be disjoint.
+  using manager_t = free_blob_manager_t;
+  constexpr uint64_t page = manager_t::FREE_BLOB_MANAGER_PAGE_SIZE;
+
+  manager_t manager;
+  // Grow the file past two pages so there is something to free inside it.
+  const auto big = manager.register_blob({uint32_t(page)});
+  const auto second = manager.register_blob({uint32_t(page)});
+  REQUIRE(big.data == 0);
+  REQUIRE(second.data == page);
+
+  // Free the tail of page 0 and the head of page 1, leaving a run that straddles the boundary.
+  constexpr uint32_t tail = 4096;
+  constexpr uint32_t head = 16384;
+  REQUIRE(manager.unregister_blob({page - tail}, {tail}));
+  REQUIRE(manager.unregister_blob({page}, {head}));
+
+  // A request bigger than either piece alone can only be met by spanning the boundary.
+  constexpr uint32_t spanning = tail + 8192;
+  const auto a = manager.register_blob({spanning});
+  CHECK(a.data == page - tail);
+
+  // Anything allocated afterwards must not land inside it.
+  const auto b = manager.register_blob({2048});
+  const bool overlaps = b.data < a.data + spanning && a.data < b.data + 2048;
+  INFO("first allocation [", a.data, ", ", a.data + spanning, ")  second [", b.data, ", ", b.data + 2048, ")");
+  CHECK_FALSE(overlaps);
+}

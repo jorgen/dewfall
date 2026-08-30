@@ -273,7 +273,13 @@ vio::task_t<bool> run_region_request(dataset_impl_t &dataset, const region_job_t
         if (!decode_positions(src, count * src_stride, count, header.point_format, header.morton_min, header.lod_span, dataset.registry().tree_config, position_format, stage->positions.data(),
                               uint64_t(count) * position_stride_bytes, stage->origin))
         {
-          stage->error = {1, "failed to decode node positions"};
+          // Named, because "failed to decode node positions" with no context is unactionable on a
+          // dataset with tens of thousands of nodes. The only way this fires is an unrecognised
+          // point_format in the deserialised header -- i.e. slot 0 did not read back as a positions
+          // blob -- so say which node and what was actually found there.
+          stage->error = {1, fmt::format("failed to decode positions for node tree {} level {} index {}: point_format type {} components {}, {} points, subset offset {} count {}",
+                                         stage->node->tree_id.data, stage->node->level, stage->node->index, int(header.point_format.type), int(header.point_format.components), header.point_count, offset,
+                                         count)};
           return;
         }
 
