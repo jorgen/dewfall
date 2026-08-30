@@ -110,10 +110,10 @@ if (DEW_PYTHON_REQUIRE_STABLE_ABI)
                             "${SKBUILD_SABI_VERSION}")
     endif ()
     nanobind_add_module(dew_python NB_STATIC STABLE_ABI ${_generated} dew_py_support.cpp
-        dew_py_support.h custom/file_convert_callbacks.h custom/query.h custom/query_async.h)
+        dew_py_support.h custom/file_convert_callbacks.h custom/amend.h custom/query.h custom/query_async.h)
 else ()
     nanobind_add_module(dew_python NB_STATIC ${_generated} dew_py_support.cpp
-        dew_py_support.h custom/file_convert_callbacks.h custom/query.h custom/query_async.h)
+        dew_py_support.h custom/file_convert_callbacks.h custom/amend.h custom/query.h custom/query_async.h)
 endif ()
 
 set_target_properties(dew_python PROPERTIES OUTPUT_NAME "_dew")
@@ -125,6 +125,15 @@ target_link_libraries(dew_python PRIVATE dew_converter dew_render dew_access dew
 # (`import dew` -> package -> ._dew) and the tests exercise that path.
 set_target_properties(dew_python PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dew")
+# A multi-config generator (MSVC, Xcode) appends the config name to LIBRARY_OUTPUT_DIRECTORY, which
+# puts the extension in dew/Release/ while __init__.py stages to dew/ -- so `import dew` from the
+# build tree fails on exactly the generators that need it most. Pinning the per-config property
+# defeats the suffix; it is a no-op for single-config generators, where the list is empty.
+foreach(_cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOUPPER "${_cfg}" _cfg_upper)
+    set_target_properties(dew_python PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_${_cfg_upper} "${CMAKE_CURRENT_BINARY_DIR}/dew")
+endforeach()
 # Tracked as a real dependency rather than a POST_BUILD step: POST_BUILD only fires when the
 # extension itself relinks, so editing only __init__.py used to leave a stale copy in the build tree
 # and the tests would import the old package.
@@ -165,7 +174,9 @@ if (APPLE)
     set_target_properties(dew_python PROPERTIES BUILD_RPATH "@loader_path")
 endif ()
 if (WIN32)
-    copy_dll_for_target(dew_python dew_render dew_converter dew_core)
+    # dew_access too: dew_python links it (see target_link_libraries above), and without it the
+    # extension cannot load from the build tree. The wheel install list already had it right.
+    copy_dll_for_target(dew_python dew_render dew_converter dew_access dew_core)
 endif ()
 
 # ---------------------------------------------------------------------------
