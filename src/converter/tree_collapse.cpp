@@ -17,6 +17,12 @@
 ************************************************************************/
 #include "tree_collapse.hpp"
 
+#include <chrono>
+
+#include <fmt/format.h>
+
+#include <atomic>
+
 #include "attributes_configs.hpp"
 #include "input_header.hpp"
 #include "morton_tree_coordinate_transform.hpp"
@@ -173,8 +179,43 @@ std::unique_ptr<uint8_t[]> make_destination_morton(const std::vector<merge_entry
 }
 } // namespace
 
+namespace
+{
+// Leaf collapse, measured. It was entirely uninstrumented while its cost was being reported as part
+// of LOD generation -- the pass clock started before collapse and only stopped after LOD, so every
+// "LOD is 93% of the conversion" statement actually covered both. Set DEW_DEBUG_LOD to print this
+// alongside the LOD probe; the counters are cumulative over the run.
+struct collapse_probe_t
+{
+  std::atomic<uint64_t> jobs{0};
+  std::atomic<uint64_t> read_us{0};    // reading every source subset's blob: blocking, on a pool thread
+  std::atomic<uint64_t> merge_us{0};   // the k-way merge (a stable_sort over all subsets' entries)
+  std::atomic<uint64_t> attrib_us{0};  // scattering source attributes into the merged unit
+  std::atomic<uint64_t> total_us{0};
+  std::atomic<uint64_t> entries{0};    // total merge entries, i.e. (chunk x leaf) subset incidences
+};
+collapse_probe_t g_collapse_probe;
+const bool g_collapse_probe_on = std::getenv("DEW_DEBUG_LOD") != nullptr;
+
+struct collapse_scoped_us_t
+{
+  std::atomic<uint64_t> &sink;
+  std::chrono::steady_clock::time_point start;
+  explicit collapse_scoped_us_t(std::atomic<uint64_t> &s)
+    : sink(s)
+    , start(std::chrono::steady_clock::now())
+  {
+  }
+  ~collapse_scoped_us_t()
+  {
+    sink.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+  }
+};
+} // namespace
+
 void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
 {
+  const auto collapse_worker_start = std::chrono::steady_clock::now();
   auto finish = [this]() {
     _completed.fetch_add(1, std::memory_order_acq_rel);
     _worker_done.post_event();
@@ -189,7 +230,11 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
   for (uint32_t subset_index = 0; subset_index < uint32_t(job.collection.data.size()); subset_index++)
   {
     auto &subset = job.collection.data[subset_index];
-    auto points = std::make_unique<read_only_points_t>(_storage, job.sources.at(subset.input_id).locations[0]);
+    std::unique_ptr<read_only_points_t> points;
+    {
+      collapse_scoped_us_t timer(g_collapse_probe.read_us);
+      points = std::make_unique<read_only_points_t>(_storage, job.sources.at(subset.input_id).locations[0]);
+    }
     if (points->error.code != 0)
     {
       if (std::getenv("DEW_DEBUG_CHAIN"))
@@ -226,7 +271,11 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
 
   // 2. Merge: subsets are internally sorted but interleave across chunks. Stable sort keeps the
   //    subset order as the tie-break for equal codes (duplicate points).
-  std::stable_sort(entries.begin(), entries.end(), [](const merge_entry_t &a, const merge_entry_t &b) { return a.absolute < b.absolute; });
+  {
+    collapse_scoped_us_t timer(g_collapse_probe.merge_us);
+    std::stable_sort(entries.begin(), entries.end(), [](const merge_entry_t &a, const merge_entry_t &b) { return a.absolute < b.absolute; });
+  }
+  g_collapse_probe.entries.fetch_add(entries.size(), std::memory_order_relaxed);
 
   // 3. Destination format: the sorter's exact rule -- lod span of [min, max] picks the narrowest
   //    morton type whose truncation is lossless for every point in the unit.
@@ -270,7 +319,10 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
 
   attribute_buffers_t buffers;
   attribute_buffers_initialize(mapping.destination, buffers, uint32_t(indecies.size()), std::move(morton_buffer));
-  quantize_attributres(_storage, job.sources, indecies, mapping, buffers);
+  {
+    collapse_scoped_us_t timer(g_collapse_probe.attrib_us);
+    quantize_attributres(_storage, job.sources, indecies, mapping, buffers);
+  }
   attribute_buffers_adjust_buffers_to_size(mapping.destination, buffers, uint32_t(indecies.size()));
 
   // 5. Write the unit (compression + residency accounting in the storage handler).
@@ -294,6 +346,13 @@ void tree_collapse_runner_t::merge_worker(collapse_job_t &job)
       job.generated_locations = std::move(locations);
     finish();
   });
+  g_collapse_probe.jobs.fetch_add(1, std::memory_order_relaxed);
+  g_collapse_probe.total_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - collapse_worker_start).count()), std::memory_order_relaxed);
+  if (g_collapse_probe_on && (g_collapse_probe.jobs.load(std::memory_order_relaxed) % 500) == 0)
+    fmt::print(stderr, "\n[collapse] {} jobs, {:.1f}s in-worker | read {:.1f}s  merge {:.1f}s  attributes {:.1f}s | {} merge entries\n", g_collapse_probe.jobs.load(std::memory_order_relaxed),
+               double(g_collapse_probe.total_us.load(std::memory_order_relaxed)) / 1e6, double(g_collapse_probe.read_us.load(std::memory_order_relaxed)) / 1e6,
+               double(g_collapse_probe.merge_us.load(std::memory_order_relaxed)) / 1e6, double(g_collapse_probe.attrib_us.load(std::memory_order_relaxed)) / 1e6,
+               g_collapse_probe.entries.load(std::memory_order_relaxed));
 }
 
 void tree_collapse_runner_t::handle_worker_done()

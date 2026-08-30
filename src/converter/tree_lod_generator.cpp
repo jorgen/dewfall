@@ -25,6 +25,7 @@
 #include "storage_handler.hpp"
 
 #include <atomic>
+#include <optional>
 #include <chrono>
 #include <cstdlib>
 #include <fixed_size_vector.hpp>
@@ -34,6 +35,61 @@
 
 namespace dew::converter
 {
+namespace
+{
+// Where LOD workers spend their time, summed across every worker on every pool thread. Set
+// DEW_DEBUG_LOD to print it when a pass finishes. The counters are PER-PASS -- reset when a pass
+// starts -- so in-worker CPU divided by pass wall is a meaningful core count. They were cumulative
+// once, which made exactly that ratio meaningless while looking authoritative.
+//
+// READ IT AS A RATIO. in-worker CPU over pass wall is how many cores the phase kept busy, and the
+// worker count is the most jobs the pool ever had to choose from. read_us is broken out separately
+// because a pool thread blocked in wait_for_read is not doing arithmetic -- lumping it in made the
+// phase look compute-bound when the time may be I/O.
+//
+// It exists because three plausible explanations for the low utilisation -- the level barrier, cache
+// pollution, and the reader loop -- were each argued from the code, each implemented or measured,
+// and each turned out not to be it. Counting settled in one run what reading had not in three.
+struct lod_probe_t
+{
+  std::atomic<uint64_t> workers{0};
+  std::atomic<uint64_t> attrib_map_us{0}; // get_lod_attribute_mapping: takes the attributes_configs mutex
+  std::atomic<uint64_t> morton_us{0};     // choosing the sample, EXCLUDING the child reads
+  std::atomic<uint64_t> attributes_us{0}; // scattering the children's attributes, EXCLUDING the reads
+  std::atomic<uint64_t> read_us{0};       // blob read + inline decompress + deserialize, blocking the pool thread
+  std::atomic<uint64_t> write_post_us{0}; // handing the result to the storage loop
+  std::atomic<uint64_t> total_us{0};
+
+  void reset()
+  {
+    workers.store(0, std::memory_order_relaxed);
+    attrib_map_us.store(0, std::memory_order_relaxed);
+    morton_us.store(0, std::memory_order_relaxed);
+    attributes_us.store(0, std::memory_order_relaxed);
+    read_us.store(0, std::memory_order_relaxed);
+    write_post_us.store(0, std::memory_order_relaxed);
+    total_us.store(0, std::memory_order_relaxed);
+  }
+};
+lod_probe_t g_lod_probe;
+const bool g_lod_probe_on = std::getenv("DEW_DEBUG_LOD") != nullptr;
+
+struct scoped_us_t
+{
+  std::atomic<uint64_t> &sink;
+  std::chrono::steady_clock::time_point start;
+  explicit scoped_us_t(std::atomic<uint64_t> &s)
+    : sink(s)
+    , start(std::chrono::steady_clock::now())
+  {
+  }
+  ~scoped_us_t()
+  {
+    sink.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+  }
+};
+} // namespace
+
 using namespace dew::core;
 
 struct children_subset_t
@@ -628,7 +684,12 @@ void quantize_attributres(storage_handler_t &cache, const child_storage_map_t &c
       // is out of bounds. Such an input contributes nothing to this destination buffer.
       if (attr_mapping.source_index < 0)
         continue;
-      read_attribute_t source_attrib_data(cache, storage_info.locations[attr_mapping.source_index], storage_info.retain_hot);
+      std::optional<read_attribute_t> attrib_read;
+      {
+        scoped_us_t timer(g_lod_probe.read_us);
+        attrib_read.emplace(cache, storage_info.locations[attr_mapping.source_index], storage_info.retain_hot);
+      }
+      read_attribute_t &source_attrib_data = *attrib_read;
       // A failed source read (e.g. unreachable destination for a spilled blob) already flagged the
       // conversion through the storage error pipe; skip the contribution instead of dereferencing.
       if (source_attrib_data.error.code != 0)
@@ -642,7 +703,12 @@ template <typename T, size_t N>
 static void quantize_subset(storage_handler_t &cache, const points_subset_t &subset, const lod_child_storage_info_t &storage_info, int lod, const std::vector<float> &random_offsets,
                             std::vector<morton_to_lod_t<T, N>> &morton_to_lod)
 {
-  read_only_points_t subset_data(cache, storage_info.locations[0], storage_info.retain_hot);
+  std::optional<read_only_points_t> subset_read;
+  {
+    scoped_us_t timer(g_lod_probe.read_us);
+    subset_read.emplace(cache, storage_info.locations[0], storage_info.retain_hot);
+  }
+  read_only_points_t &subset_data = *subset_read;
   // Failed read: conversion is flagged (storage error pipe); contribute nothing rather than crash.
   if (subset_data.error.code != 0)
     return;
@@ -793,50 +859,6 @@ static void quantize_morton_remember_indecies(storage_handler_t &cache, const mo
     assert("This should not happen");
   }
 }
-
-namespace
-{
-// Where LOD workers spend their time, accumulated across every worker on every pool thread. Set
-// DEW_DEBUG_LOD to print it when a pass finishes. The counters are CUMULATIVE over the run; only the
-// pass wall time is per-pass.
-//
-// READ IT AS A RATIO. in-worker CPU divided by pass wall time is how many cores the phase actually
-// kept busy, and the worker count is the most jobs the pool could ever have had to choose from. The
-// first measurement it produced -- 271 workers and 121.5s of CPU across 207.5s of wall, on 70M
-// points -- said the phase is limited by having too few, too coarse jobs, not by contention:
-// attrib_map (the attributes_configs mutex) and write_post (handing off to the storage loop) were
-// both 0.0s.
-//
-// It exists because three plausible explanations for the low utilisation -- the level barrier, cache
-// pollution, and the reader loop -- were each argued from the code, each implemented or measured,
-// and each turned out not to be it. Counting settled in one run what reading had not in three.
-struct lod_probe_t
-{
-  std::atomic<uint64_t> workers{0};
-  std::atomic<uint64_t> attrib_map_us{0}; // get_lod_attribute_mapping: takes the attributes_configs mutex
-  std::atomic<uint64_t> morton_us{0};     // reading children's positions + choosing the sample
-  std::atomic<uint64_t> attributes_us{0}; // reading and sampling the children's other attributes
-  std::atomic<uint64_t> write_post_us{0}; // handing the result to the storage loop
-  std::atomic<uint64_t> total_us{0};
-};
-lod_probe_t g_lod_probe;
-const bool g_lod_probe_on = std::getenv("DEW_DEBUG_LOD") != nullptr;
-
-struct scoped_us_t
-{
-  std::atomic<uint64_t> &sink;
-  std::chrono::steady_clock::time_point start;
-  explicit scoped_us_t(std::atomic<uint64_t> &s)
-    : sink(s)
-    , start(std::chrono::steady_clock::now())
-  {
-  }
-  ~scoped_us_t()
-  {
-    sink.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
-  }
-};
-} // namespace
 
 void lod_worker_t::work()
 {
@@ -1053,6 +1075,7 @@ tree_lod_generator_t::tree_lod_generator_t(vio::event_loop_t &loop, vio::thread_
 
 void tree_lod_generator_t::generate_lods(tree_id_t &tree_id, const morton::morton192_t &max)
 {
+  g_lod_probe.reset(); // per-pass, so in-worker CPU over pass wall is a real core count
   std::vector<lod_tree_worker_data_t> to_lod;
   lod_node_worker_data_t fake_parent;
   fake_parent.node_min = _tree_cache.data[tree_id.data]->morton_min;
@@ -1115,10 +1138,11 @@ void tree_lod_generator_t::iterate_workers()
     {
       const auto workers = g_lod_probe.workers.load(std::memory_order_relaxed);
       const auto total = g_lod_probe.total_us.load(std::memory_order_relaxed);
-      fmt::print(stderr, "\n[lod] pass {:.1f}s wall | cumulative: {} workers, {:.1f}s in-worker | attrib_map {:.1f}s  morton {:.1f}s  attributes {:.1f}s  write_post {:.1f}s\n",
-                 double(lod_us) / 1e6, workers, double(total) / 1e6, double(g_lod_probe.attrib_map_us.load(std::memory_order_relaxed)) / 1e6,
+      fmt::print(stderr, "\n[lod] collapse {:.1f}s + lod {:.1f}s wall | {} workers, {:.1f}s in-worker ({:.2f} cores) | read {:.1f}s  morton {:.1f}s  attributes {:.1f}s  attrib_map {:.1f}s  write_post {:.1f}s\n",
+                 double(_perf_stats.collapse_time_us.load(std::memory_order_relaxed)) / 1e6, double(lod_us) / 1e6, workers, double(total) / 1e6,
+                 lod_us ? double(total) / double(lod_us) : 0.0, double(g_lod_probe.read_us.load(std::memory_order_relaxed)) / 1e6,
                  double(g_lod_probe.morton_us.load(std::memory_order_relaxed)) / 1e6, double(g_lod_probe.attributes_us.load(std::memory_order_relaxed)) / 1e6,
-                 double(g_lod_probe.write_post_us.load(std::memory_order_relaxed)) / 1e6);
+                 double(g_lod_probe.attrib_map_us.load(std::memory_order_relaxed)) / 1e6, double(g_lod_probe.write_post_us.load(std::memory_order_relaxed)) / 1e6);
     }
     _lod_done.post_event();
   }

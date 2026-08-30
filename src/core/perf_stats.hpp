@@ -100,6 +100,11 @@ struct perf_stats_t
   std::atomic<uint64_t> tree_build_time_us{0};
   std::atomic<uint64_t> lod_generation_time_us{0};
   time_point_t lod_start;
+  // Leaf collapse, timed apart from LOD. The two ran under one clock until it turned out that the
+  // "LOD" duration had collapse folded into it; they are different algorithms with different costs
+  // and only one of them was instrumented.
+  std::atomic<uint64_t> collapse_time_us{0};
+  time_point_t collapse_start;
   std::atomic<bool> lod_phase{false};
 
   std::atomic<uint64_t> cache_hits{0};

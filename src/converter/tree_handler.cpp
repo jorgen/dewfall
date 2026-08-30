@@ -416,7 +416,11 @@ void tree_handler_t::handle_generate_lod(morton::morton192_t &&max)
 {
   if (std::getenv("DEW_DEBUG_CHAIN"))
     fmt::print(stderr, "[sched] handle_generate_lod target={}\n", max.data[0]);
-  _perf_stats.lod_start = perf_stats_t::clock_t::now();
+  // COLLAPSE first, then LOD -- and they are timed separately. This stamp used to be lod_start, which
+  // made every reported "LOD pass" duration actually cover collapse as well, because collapse runs
+  // below and LOD only starts in its completion callback. That silently attributed the whole of leaf
+  // collapse to LOD generation and made the phase look arithmetic-bound when it may not be.
+  _perf_stats.collapse_start = perf_stats_t::clock_t::now();
   _perf_stats.lod_phase.store(true, std::memory_order_release);
   // Record the pass TARGET; it is only promoted to the finality watermark when the pass completes
   // (handle_serialize_trees) -- marking against an in-flight target would finalize trees whose LOD
@@ -429,7 +433,12 @@ void tree_handler_t::handle_generate_lod(morton::morton192_t &&max)
   // Collapse first: leaves of trees this pass will finalize are already immutable, and the LOD
   // level-5 sampling below then reads the small per-node units instead of whole ingest chunks.
   // on_done runs on the tree loop.
-  _tree_collapse.collapse_for_pass(max, [this, max]() { _tree_lod_generator.generate_lods(_tree_registry.root, max); });
+  _tree_collapse.collapse_for_pass(max, [this, max]() {
+    const auto collapse_end = perf_stats_t::clock_t::now();
+    _perf_stats.collapse_time_us.store(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(collapse_end - _perf_stats.collapse_start).count()), std::memory_order_relaxed);
+    _perf_stats.lod_start = collapse_end;
+    _tree_lod_generator.generate_lods(_tree_registry.root, max);
+  });
 }
 
 void tree_handler_t::set_input_registry_snapshot_provider(std::function<std::vector<uint8_t>()> provider)
