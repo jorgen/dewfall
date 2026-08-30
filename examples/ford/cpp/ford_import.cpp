@@ -67,7 +67,7 @@ int usage()
   fmt::print(stderr,
              "usage:\n"
              "  ford_import inspect <dataset-root> [--scan N]\n"
-             "  ford_import convert <dataset-root> <output.dew> [--scans N] [--scale M] [--stride N] [--finalize]\n"
+             "  ford_import convert <dataset-root> <output.dew> [--scans N] [--scale M] [--stride N] [--finalize] [--read-cache-mb N]\n"
              "  ford_import colour  <dataset-root> <dataset.dew> [--scans N]\n");
   return 2;
 }
@@ -181,7 +181,7 @@ int inspect(const std::string &root, int scan_ordinal)
 }
 
 
-int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride, bool finalize)
+int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride, bool finalize, uint64_t read_cache_bytes)
 {
   std::string error;
   ford::dataset_t dataset;
@@ -240,6 +240,13 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
 
   // MUTABLE, so the dataset stays amendable: pass 2 adds colour to it without reconverting. It is
   // sealed by dew_converter_finalize once nothing more will be added.
+  // The blob reader's cache defaults to 256 MB. It matters more than it looks: on a cache MISS the
+  // blob is zstd-decompressed INLINE on the reader's single event-loop thread (blob_reader.cpp,
+  // do_read_request), while a HIT with decompress_inline -- which the LOD readers pass -- decompresses
+  // on the calling pool thread. So the cache size decides whether LOD decompression is serialised on
+  // one thread or spread across the pool.
+  if (read_cache_bytes)
+    dew_converter_set_read_cache_bytes(converter, read_cache_bytes);
   dew_converter_set_mutable(converter, 1);
   // Without this the key does not survive LOD -- the default keep-list is rgb/intensity/
   // classification, so coarse nodes would drop scan_key and only the leaves could be coloured.
@@ -409,6 +416,16 @@ int main(int argc, char **argv)
   int stride = 32;
   double scale = 0.001;
   bool finalize = false;
+  // 1 GB rather than the library's 256 MB default, because it is worth a lot here and the default is
+  // sized for a much smaller dataset. On a cache MISS a blob is zstd-decompressed INLINE on the blob
+  // reader's single event-loop thread; on a HIT with decompress_inline -- which the LOD and collapse
+  // readers pass -- it decompresses on the calling pool thread. So the cache size decides whether
+  // decompression is serialised on one thread or spread across the pool.
+  //
+  // Measured on 1400 scans (110M points), 256 MB vs 4 GB: ingest 102.1s -> 57.9s, LOD+collapse
+  // 489.2s -> 335.4s, total 591.3s -> 393.3s. A 500-scan run shows nothing, because that dataset
+  // fits in 256 MB and every read hits either way.
+  uint64_t read_cache_bytes = 1024ull << 20;
   std::string output;
   int first_option = 3;
   if (command == "convert" || command == "colour")
@@ -430,6 +447,8 @@ int main(int argc, char **argv)
       scale = atof(argv[++i]);
     else if (strcmp(argv[i], "--finalize") == 0)
       finalize = true;
+    else if (strcmp(argv[i], "--read-cache-mb") == 0 && i + 1 < argc)
+      read_cache_bytes = uint64_t(atoll(argv[++i])) << 20;
     else
       return usage();
   }
@@ -439,7 +458,7 @@ int main(int argc, char **argv)
   {
     if (output.empty())
       return usage();
-    return convert(root, output, scan_limit, scale, stride, finalize);
+    return convert(root, output, scan_limit, scale, stride, finalize, read_cache_bytes);
   }
   if (command == "colour")
   {
