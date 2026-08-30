@@ -26,6 +26,7 @@
 #include "tree.hpp"
 
 #include <ankerl/unordered_dense.h>
+#include <memory>
 #include <deque>
 
 namespace dew::core
@@ -79,33 +80,46 @@ struct lod_worker_batch_t;
 class lod_worker_t
 {
 public:
-  lod_worker_t(tree_lod_generator_t &lod_generator, lod_worker_batch_t &batch, storage_handler_t &cache, attributes_configs_t &attributes_configs, lod_node_worker_data_t &data, const std::vector<float> &random_offsets);
+  lod_worker_t(tree_lod_generator_t &lod_generator, lod_worker_batch_t &batch, uint32_t tree_index, storage_handler_t &cache, attributes_configs_t &attributes_configs, lod_node_worker_data_t &data,
+               const std::vector<float> &random_offsets);
   void work();
   void enqueue_lod(vio::thread_pool_t &pool)
   {
     pool.enqueue([this] { this->work(); });
   }
-  void mark_done() { _done = true; }
-  [[nodiscard]] bool done() const { return _done; }
-
 private:
   tree_lod_generator_t &lod_generator;
   lod_worker_batch_t &batch;
+  uint32_t tree_index; // which tree in batch.worker_data this node belongs to
   storage_handler_t &cache;
   attributes_configs_t &attributes_configs;
   lod_node_worker_data_t &data;
   const std::vector<float> &random_offsets;
-  bool _done{false};
 };
 
+// One magnitude's worth of trees, each walking its own five levels.
+//
+// The levels of a SINGLE tree are strictly ordered -- a node samples its children, so level L waits
+// for L+1. Trees in the same batch are NOT ordered against each other: a node's children live either
+// in its own tree or, at level 4, in a SUB-tree, and a sub-tree has magnitude-1 and therefore lives
+// in an earlier batch. Sibling trees at one magnitude never reference each other.
+//
+// The scheduler used to barrier on the whole batch at every level, so every tree waited for the
+// slowest one five times over, and each tree's level 0 is a single node -- so the tail of every
+// batch ran nearly serial with the pool idle. Per-tree progression removes that without touching the
+// dependency order.
 struct lod_worker_batch_t
 {
   std::vector<lod_tree_worker_data_t> worker_data;
-  std::vector<lod_worker_t> lod_workers;
-  std::atomic_int completed = 0;
-  int batch_size = 0;
-  int level = 5;
-  bool new_batch = true;
+
+  // Parallel to worker_data. Kept here rather than inside lod_tree_worker_data_t because that type is
+  // moved into the batch (std::make_move_iterator) and std::atomic is not movable.
+  std::vector<std::vector<lod_worker_t>> tree_workers;
+  std::vector<int> tree_level;     // next level to descend to; starts at 5, done at < 0
+  std::vector<int> tree_in_flight; // workers enqueued for the current level; written on the tree loop before enqueue
+  std::unique_ptr<std::atomic_int[]> tree_completed;
+  int trees_active = 0;
+  bool started = false;
 };
 
 class tree_lod_generator_t
@@ -124,9 +138,12 @@ public:
 
   void iterate_workers();
 
-  void add_worker_done(lod_worker_batch_t &batch)
+  // Called from the STORAGE loop (the write completion callback). Only ever touches this tree's own
+  // counter, and only the completion that finishes a tree's level wakes the tree loop -- so the wake
+  // rate is unchanged from the old per-batch-level scheme, just attributed per tree.
+  void add_worker_done(lod_worker_batch_t &batch, uint32_t tree_index)
   {
-    if (++batch.completed == batch.batch_size)
+    if (++batch.tree_completed[tree_index] == batch.tree_in_flight[tree_index])
     {
       _iterate_workers.post_event();
     }

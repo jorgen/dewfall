@@ -283,10 +283,12 @@ static void tree_get_work_items(tree_registry_t &tree_cache, storage_handler_t &
     to_lod.push_back(std::move(lod_tree_worker_data));
 }
 
-lod_worker_t::lod_worker_t(tree_lod_generator_t &a_lod_generator, lod_worker_batch_t &a_batch, storage_handler_t &a_cache, attributes_configs_t &a_attributes_configs, lod_node_worker_data_t &a_data,
+lod_worker_t::lod_worker_t(tree_lod_generator_t &a_lod_generator, lod_worker_batch_t &a_batch, uint32_t a_tree_index, storage_handler_t &a_cache, attributes_configs_t &a_attributes_configs,
+                           lod_node_worker_data_t &a_data,
                            const std::vector<float> &a_random_offsets)
   : lod_generator(a_lod_generator)
   , batch(a_batch)
+  , tree_index(a_tree_index)
   , cache(a_cache)
   , attributes_configs(a_attributes_configs)
   , data(a_data)
@@ -840,7 +842,7 @@ void lod_worker_t::work()
                 (void)error;
                 this->data.generated_attributes_id = attrib_id;
                 this->data.generated_locations = std::move(locations);
-                this->lod_generator.add_worker_done(this->batch);
+                this->lod_generator.add_worker_done(this->batch, this->tree_index);
               });
 }
 
@@ -865,80 +867,106 @@ static void get_storage_info(tree_registry_t &tree_cache, lod_node_worker_data_t
   }
 }
 
-static void adjust_tree_after_lod(tree_registry_t &tree_cache, std::vector<lod_tree_worker_data_t> &to_adjust, int level)
+// Publish ONE tree's finished level into the tree. Per-tree rather than per-batch, which is what
+// lets trees progress independently -- the only thing the old whole-batch version shared across
+// trees was a linear cursor into node_ids, and that was an optimisation, not a dependency.
+static void adjust_tree_after_lod(tree_registry_t &tree_cache, lod_tree_worker_data_t &adjust_data, int level)
 {
-  for (auto &adjust_data : to_adjust)
+  if (adjust_data.nodes[level].empty())
+    return;
+  tree_t *tree = tree_cache.get(adjust_data.tree_id);
+  // A finalized tree's LOD was fully generated in (or before) its finalizing pass; writing LOD
+  // data into it now means the watermark/finality logic is broken -- fail loudly (the upload
+  // and eviction tiers treat finalized trees as immutable).
+  assert(tree_cache.tree_state[adjust_data.tree_id.data] == uint8_t(tree_state_t::building) && "LOD write into finalized tree");
+  // Writing LOD point counts / storage locations mutates the tree's serialized state, so mark it dirty.
+  // Otherwise a tree that was already serialized-and-cleaned by an earlier (empty) LOD pass — which
+  // happens with multi-file input, where LOD is first triggered on a partial done-morton watermark
+  // before all files land — never gets re-serialized, and its LOD is silently dropped on disk.
+  tree->is_dirty = true;
+  int tree_index = 0;
+  for (int node_index = 0; node_index < int(adjust_data.nodes[level].size()); node_index++)
   {
-    tree_t *tree = tree_cache.get(adjust_data.tree_id);
-    if (adjust_data.nodes[level].empty())
-      continue;
-    // A finalized tree's LOD was fully generated in (or before) its finalizing pass; writing LOD
-    // data into it now means the watermark/finality logic is broken -- fail loudly (the upload
-    // and eviction tiers treat finalized trees as immutable).
-    assert(tree_cache.tree_state[adjust_data.tree_id.data] == uint8_t(tree_state_t::building) && "LOD write into finalized tree");
-    // Writing LOD point counts / storage locations mutates the tree's serialized state, so mark it dirty.
-    // Otherwise a tree that was already serialized-and-cleaned by an earlier (empty) LOD pass — which
-    // happens with multi-file input, where LOD is first triggered on a partial done-morton watermark
-    // before all files land — never gets re-serialized, and its LOD is silently dropped on disk.
-    tree->is_dirty = true;
-    int tree_index = 0;
-    for (int node_index = 0; node_index < int(adjust_data.nodes[level].size()); node_index++)
-    {
-      auto current = adjust_data.nodes[level][node_index].id;
-      auto &node_ids = tree->node_ids[level];
+    auto current = adjust_data.nodes[level][node_index].id;
+    auto &node_ids = tree->node_ids[level];
 
-      while (tree_index < int(node_ids.size()) && node_ids[tree_index] < current)
-        tree_index++;
-      assert(node_ids[tree_index] == current);
-      auto &done_node = adjust_data.nodes[level][node_index];
-      auto &points_collection = tree->data[level][tree_index];
-      points_collection.point_count = done_node.generated_point_count.data;
-      points_collection.min = done_node.generated_min;
-      points_collection.max = done_node.generated_max;
-      assert(points_collection.data.size() == 1);
-      points_collection.data[0].count.data = done_node.generated_point_count.data;
-      points_collection.data[0].offset.data = 0;
-      tree->storage_map.add_storage(done_node.storage_name, done_node.generated_attributes_id, std::move(done_node.generated_locations));
-    }
+    while (tree_index < int(node_ids.size()) && node_ids[tree_index] < current)
+      tree_index++;
+    assert(node_ids[tree_index] == current);
+    auto &done_node = adjust_data.nodes[level][node_index];
+    auto &points_collection = tree->data[level][tree_index];
+    points_collection.point_count = done_node.generated_point_count.data;
+    points_collection.min = done_node.generated_min;
+    points_collection.max = done_node.generated_max;
+    assert(points_collection.data.size() == 1);
+    points_collection.data[0].count.data = done_node.generated_point_count.data;
+    points_collection.data[0].offset.data = 0;
+    tree->storage_map.add_storage(done_node.storage_name, done_node.generated_attributes_id, std::move(done_node.generated_locations));
   }
 }
 
-static void iterate_batch(const std::vector<float> &random_offsets, tree_lod_generator_t &lod_generator, lod_worker_batch_t &batch, tree_registry_t &tree_cache, storage_handler_t &cache_file,
-                          attributes_configs_t &attributes_configs, vio::event_loop_t &loop, vio::thread_pool_t &pool)
+// Move ONE tree to its next level, if the level it was working on has finished. Returns true if the
+// tree just retired (no levels left), so the caller can decrement trees_active.
+//
+// Runs on the tree loop. tree_in_flight is written here, before any worker for the level is
+// enqueued, and read on the storage loop by add_worker_done -- so it is stable for the whole time
+// any worker could observe it.
+static bool advance_tree(const std::vector<float> &random_offsets, tree_lod_generator_t &lod_generator, lod_worker_batch_t &batch, uint32_t tree_index, tree_registry_t &tree_cache,
+                         storage_handler_t &cache_file, attributes_configs_t &attributes_configs, vio::thread_pool_t &pool)
 {
-  (void)loop;
-  if (!batch.new_batch)
-    adjust_tree_after_lod(tree_cache, batch.worker_data, batch.level);
+  auto &tree = batch.worker_data[tree_index];
+  int &level = batch.tree_level[tree_index];
+  if (level < 0)
+    return false; // already retired
 
-  batch.new_batch = false;
-  for (auto &worker : batch.lod_workers)
-    worker.mark_done();
-  batch.lod_workers.clear();
-  batch.level--;
-  batch.completed = 0;
-
-  size_t batch_size = 0;
-  while (batch_size == 0 && batch.level >= 0)
+  if (batch.tree_in_flight[tree_index] > 0)
   {
-    for (auto &tree : batch.worker_data)
-      batch_size += tree.nodes[batch.level].size();
-    if (batch_size == 0)
-      batch.level--;
+    if (batch.tree_completed[tree_index].load(std::memory_order_acquire) < batch.tree_in_flight[tree_index])
+      return false; // this tree's level is still running; another tree may still make progress
+    adjust_tree_after_lod(tree_cache, tree, level);
+    batch.tree_workers[tree_index].clear();
+    batch.tree_in_flight[tree_index] = 0;
+    batch.tree_completed[tree_index].store(0, std::memory_order_relaxed);
   }
-  batch.batch_size = int(batch_size);
 
-  batch.lod_workers.reserve(batch_size);
-
-  for (auto &tree : batch.worker_data)
+  size_t node_count = 0;
+  while (node_count == 0 && level > 0)
   {
-    for (auto &node : tree.nodes[batch.level])
-    {
-      assert(!node.child_data.empty());
-      get_storage_info(tree_cache, node);
-      auto &lod_worker = batch.lod_workers.emplace_back(lod_generator, batch, cache_file, attributes_configs, node, random_offsets);
-      lod_worker.enqueue_lod(pool);
-    }
+    level--;
+    node_count = tree.nodes[level].size();
   }
+  if (node_count == 0)
+  {
+    level = -1; // nothing left at any level
+    return true;
+  }
+
+  batch.tree_in_flight[tree_index] = int(node_count);
+  auto &workers = batch.tree_workers[tree_index];
+  // Reserved, not grown: workers are enqueued as they are constructed and hold a reference to their
+  // own element, so a reallocation mid-loop would dangle every worker already running.
+  workers.reserve(node_count);
+  for (auto &node : tree.nodes[level])
+  {
+    assert(!node.child_data.empty());
+    get_storage_info(tree_cache, node);
+    auto &lod_worker = workers.emplace_back(lod_generator, batch, tree_index, cache_file, attributes_configs, node, random_offsets);
+    lod_worker.enqueue_lod(pool);
+  }
+  return false;
+}
+
+static void start_batch(lod_worker_batch_t &batch)
+{
+  const size_t trees = batch.worker_data.size();
+  batch.tree_workers.resize(trees);
+  batch.tree_level.assign(trees, 5);
+  batch.tree_in_flight.assign(trees, 0);
+  batch.tree_completed = std::make_unique<std::atomic_int[]>(trees);
+  for (size_t i = 0; i < trees; i++)
+    batch.tree_completed[i].store(0, std::memory_order_relaxed);
+  batch.trees_active = int(trees);
+  batch.started = true;
 }
 
 tree_lod_generator_t::tree_lod_generator_t(vio::event_loop_t &loop, vio::thread_pool_t &thread_pool, tree_registry_t &tree_cache, storage_handler_t &file_cache, attributes_configs_t &attributes_configs,
@@ -991,15 +1019,25 @@ void tree_lod_generator_t::generate_lods(tree_id_t &tree_id, const morton::morto
 
 void tree_lod_generator_t::iterate_workers()
 {
-  if (!_lod_batches.empty() && _lod_batches.front()->completed == int(_lod_batches.front()->lod_workers.size()) && _lod_batches.front()->level == 0)
+  // Drive the FRONT batch only. Batches are ordered by magnitude, and a tree's level-4 nodes sample
+  // sub-trees, which have magnitude-1 and live in an earlier batch -- so batches must still run in
+  // order. Within the batch every tree is independent, so sweep them all and advance whichever can.
+  while (!_lod_batches.empty())
   {
-    adjust_tree_after_lod(_tree_cache, _lod_batches.front()->worker_data, 0);
-    for (auto &worker : _lod_batches.front()->lod_workers)
-      worker.mark_done();
+    auto &batch = *_lod_batches.front();
+    if (!batch.started)
+      start_batch(batch);
+
+    for (uint32_t tree_index = 0; tree_index < uint32_t(batch.worker_data.size()); tree_index++)
+    {
+      if (advance_tree(_random_offsets, *this, batch, tree_index, _tree_cache, _file_cache, _attributes_configs, _thread_pool))
+        batch.trees_active--;
+    }
+    if (batch.trees_active > 0)
+      break; // work is in flight; the completion that finishes a tree's level wakes us again
     _lod_batches.pop_front();
   }
-  if (!_lod_batches.empty() && (_lod_batches.front()->new_batch || _lod_batches.front()->completed == int(_lod_batches.front()->lod_workers.size())))
-    iterate_batch(_random_offsets, *this, *_lod_batches.front(), _tree_cache, _file_cache, _attributes_configs, _loop, _thread_pool);
+
   if (_lod_batches.empty())
   {
     auto lod_end = perf_stats_t::clock_t::now();
