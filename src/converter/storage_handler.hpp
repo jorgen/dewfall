@@ -253,10 +253,11 @@ struct read_only_points_t
 
 struct read_attribute_t
 {
-  read_attribute_t(storage_handler_t &a_storage_handler, storage_location_t a_location)
+  // retain_hot: see read_only_points_t / read_options_t::retain_hot.
+  read_attribute_t(storage_handler_t &a_storage_handler, storage_location_t a_location, bool retain_hot = true)
     : storage_handler(a_storage_handler)
     , location(a_location)
-    , read_request(a_storage_handler.read(a_location, /*raw=*/false, /*decompress_inline=*/true))
+    , read_request(a_storage_handler.read(a_location, read_options_t{/*raw=*/false, /*decompress_inline=*/true, {}, retain_hot}))
   {
     read_request->wait_for_read();
     // A failed read leaves data empty; callers MUST check `error` before dereferencing.

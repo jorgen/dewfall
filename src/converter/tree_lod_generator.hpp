@@ -43,6 +43,10 @@ struct lod_child_storage_info_t
 {
   attributes_id_t attributes_id;
   std::vector<storage_location_t> locations;
+  // False when this parent consumes the child's unit WHOLE, i.e. it is the blob's only reader and
+  // there is no point keeping it at the hot end of the cache. Decided in get_storage_info, where the
+  // subset counts and the storage locations are both in scope.
+  bool retain_hot = true;
 };
 
 using child_storage_map_t = ankerl::unordered_dense::map<input_data_id_t, lod_child_storage_info_t, input_data_id_hash_t>;
