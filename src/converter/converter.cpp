@@ -173,6 +173,11 @@ void dew_converter_set_read_cache_bytes(dew_converter_t *converter, uint64_t max
   converter->processor.storage_handler().set_read_cache_size(max_bytes);
 }
 
+void dew_converter_set_decompressed_cache_bytes(dew_converter_t *converter, uint64_t max_bytes)
+{
+  converter->processor.storage_handler().set_decompressed_cache_size(max_bytes);
+}
+
 void dew_converter_set_upload_callbacks(dew_converter_t *converter, dew_converter_upload_callbacks_t callbacks, void *user_ptr)
 {
   converter->processor.set_upload_callbacks(callbacks, user_ptr);

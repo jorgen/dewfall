@@ -17,6 +17,12 @@
 ************************************************************************/
 #include "blob_reader.hpp"
 
+#include <fmt/format.h>
+
+#include <cstdlib>
+
+#include <atomic>
+
 #include "compressor.hpp"
 #include "loop_hop.hpp"
 
@@ -196,6 +202,51 @@ read_request_t::awaiter_t co_read(blob_reader_t &reader, storage_location_t loca
   return out->await_on(resume_loop);
 }
 
+namespace
+{
+// Read-path outcome counters. Set DEW_DEBUG_READ to print them periodically.
+//
+// The aggregate "cache hit rate" conflates two very different outcomes: a DECOMPRESSED-cache hit
+// costs a map lookup, while a compressed-cache hit costs a full zstd decompress every single time.
+// A workload that re-reads the same blob many times can therefore show a 99.5% hit rate and still
+// spend all its time decompressing -- which is exactly what leaf collapse looks like, since a chunk
+// unit is re-read once per leaf it spans.
+struct read_probe_t
+{
+  std::atomic<uint64_t> decompressed_hits{0}; // free: the decoded bytes were still cached
+  std::atomic<uint64_t> compressed_hits{0};   // bytes cached, but decompressed AGAIN
+  std::atomic<uint64_t> misses{0};            // read from the backend
+  std::atomic<uint64_t> decompress_us{0};     // time in decompress_any on the two paths that pay it
+  std::atomic<uint64_t> decompressed_bytes{0};
+};
+read_probe_t g_read_probe;
+const bool g_read_probe_on = std::getenv("DEW_DEBUG_READ") != nullptr;
+
+void read_probe_report()
+{
+  if (!g_read_probe_on)
+    return;
+  const uint64_t d = g_read_probe.decompressed_hits.load(std::memory_order_relaxed);
+  const uint64_t c = g_read_probe.compressed_hits.load(std::memory_order_relaxed);
+  const uint64_t m = g_read_probe.misses.load(std::memory_order_relaxed);
+  const uint64_t total = d + c + m;
+  if (total == 0 || (total % 200000) != 0)
+    return;
+  fmt::print(stderr, "\n[read] {} reads: {:.1f}% decoded-hit, {:.1f}% recompressed-hit, {:.1f}% miss | {:.1f}s decompressing {:.2f} GB\n", total, 100.0 * double(d) / double(total),
+             100.0 * double(c) / double(total), 100.0 * double(m) / double(total), double(g_read_probe.decompress_us.load(std::memory_order_relaxed)) / 1e6,
+             double(g_read_probe.decompressed_bytes.load(std::memory_order_relaxed)) / 1e9);
+}
+
+struct decompress_timer_t
+{
+  std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+  ~decompress_timer_t()
+  {
+    g_read_probe.decompress_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+  }
+};
+} // namespace
+
 void blob_reader_t::invalidate(storage_location_t location)
 {
   const cache_key_t key{location.file_id, location.offset};
@@ -238,6 +289,8 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
     if (decompressed_hit.has_value())
     {
       _perf_stats.cache_hits.fetch_add(1, std::memory_order_relaxed);
+      g_read_probe.decompressed_hits.fetch_add(1, std::memory_order_relaxed);
+      read_probe_report();
       ret->buffer = decompressed_hit->data;
       ret->buffer_info.data = ret->buffer.get();
       ret->buffer_info.size = decompressed_hit->size;
@@ -286,6 +339,10 @@ std::shared_ptr<read_request_t> blob_reader_t::read(storage_location_t location,
 #endif
     if (compressed)
     {
+      g_read_probe.compressed_hits.fetch_add(1, std::memory_order_relaxed);
+      g_read_probe.decompressed_bytes.fetch_add(cv.compressed_size, std::memory_order_relaxed);
+      read_probe_report();
+      decompress_timer_t decompress_timer;
       auto decompressed = decompress_any(cv.compressed_data.get(), cv.compressed_size);
       if (decompressed.error.code == 0)
       {
@@ -376,6 +433,9 @@ vio::task_t<void> blob_reader_t::do_read_request(std::shared_ptr<read_request_t>
     // Decompress if needed -- unless this is a raw read (the decode worker decompresses off-thread).
     if (!read_request->raw && read_request->buffer && has_compression_magic(read_request->buffer.get(), read_request->buffer_info.size))
     {
+      g_read_probe.misses.fetch_add(1, std::memory_order_relaxed);
+      read_probe_report();
+      decompress_timer_t decompress_timer;
       auto decompressed = decompress_any(read_request->buffer.get(), read_request->buffer_info.size);
       if (decompressed.error.code == 0)
       {

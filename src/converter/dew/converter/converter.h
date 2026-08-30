@@ -257,6 +257,19 @@ DEW_CONVERTER_EXPORT void dew_converter_set_cache_max_bytes(struct dew_converter
 // In-RAM decompressed read-cache budget (default 256MB). Also the seam a render/query consumer tunes.
 DEW_CONVERTER_EXPORT void dew_converter_set_read_cache_bytes(struct dew_converter_t *converter, uint64_t max_bytes);
 
+/* Size the DECOMPRESSED blob cache (default 256 MB).
+ *
+ * Distinct from the read cache above, and on a large conversion it matters more. The read cache
+ * holds COMPRESSED bytes: a hit there still costs a full zstd decompress, every time. This one holds
+ * the decoded bytes, so a hit costs a lookup.
+ *
+ * Leaf collapse re-reads a chunk unit once per leaf it spans, so the same blob is decoded over and
+ * over. Measured on a 70M-point conversion with a 4 GB read cache and this left at its default:
+ * 1.2M reads, 48% of them "cache hits" that decompressed again, 2798 CPU-seconds inflating 115 GB --
+ * about 60% of all CPU the conversion used. Decoded data is several times larger than compressed, so
+ * size this generously or it holds almost nothing. */
+DEW_CONVERTER_EXPORT void dew_converter_set_decompressed_cache_bytes(struct dew_converter_t *converter, uint64_t max_bytes);
+
 DEW_CONVERTER_EXPORT void dew_converter_set_upload_callbacks(struct dew_converter_t *converter, struct dew_converter_upload_callbacks_t callbacks, void *user_ptr);
 
 // Snapshot of upload/cache-tier state (approximate counters; safe any time). Returns false when the

@@ -181,7 +181,7 @@ int inspect(const std::string &root, int scan_ordinal)
 }
 
 
-int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride, bool finalize, uint64_t read_cache_bytes)
+int convert(const std::string &root, const std::string &output, int scan_limit, double scale, int stride, bool finalize, uint64_t read_cache_bytes, uint64_t decompressed_cache_bytes)
 {
   std::string error;
   ford::dataset_t dataset;
@@ -246,7 +246,13 @@ int convert(const std::string &root, const std::string &output, int scan_limit, 
   // on the calling pool thread. So the cache size decides whether LOD decompression is serialised on
   // one thread or spread across the pool.
   if (read_cache_bytes)
+  {
     dew_converter_set_read_cache_bytes(converter, read_cache_bytes);
+    // The decompressed cache matters MORE than the compressed one here: collapse re-reads a chunk
+    // unit once per leaf it spans, and a compressed-cache hit re-inflates it every time. Measured at
+    // the 256 MB default: 48% of reads were hits that decompressed again, 2798 CPU-seconds on 115 GB.
+    dew_converter_set_decompressed_cache_bytes(converter, decompressed_cache_bytes ? decompressed_cache_bytes : read_cache_bytes);
+  }
   dew_converter_set_mutable(converter, 1);
   // Without this the key does not survive LOD -- the default keep-list is rgb/intensity/
   // classification, so coarse nodes would drop scan_key and only the leaves could be coloured.
@@ -433,6 +439,7 @@ int main(int argc, char **argv)
   // 489.2s -> 335.4s, total 591.3s -> 393.3s. A 500-scan run shows nothing, because that dataset
   // fits in 256 MB and every read hits either way.
   uint64_t read_cache_bytes = 1024ull << 20;
+  uint64_t decompressed_cache_bytes = 0;
   std::string output;
   int first_option = 3;
   if (command == "convert" || command == "colour")
@@ -456,6 +463,8 @@ int main(int argc, char **argv)
       finalize = true;
     else if (strcmp(argv[i], "--read-cache-mb") == 0 && i + 1 < argc)
       read_cache_bytes = uint64_t(atoll(argv[++i])) << 20;
+    else if (strcmp(argv[i], "--decoded-cache-mb") == 0 && i + 1 < argc)
+      decompressed_cache_bytes = uint64_t(atoll(argv[++i])) << 20;
     else
       return usage();
   }
@@ -465,7 +474,7 @@ int main(int argc, char **argv)
   {
     if (output.empty())
       return usage();
-    return convert(root, output, scan_limit, scale, stride, finalize, read_cache_bytes);
+    return convert(root, output, scan_limit, scale, stride, finalize, read_cache_bytes, decompressed_cache_bytes);
   }
   if (command == "colour")
   {
