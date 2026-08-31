@@ -32,3 +32,8 @@ __pycache__/
 dist/
 wheelhouse/
 *.egg-info/
+
+# editor swap files
+*.swp
+*.swo
+*~
