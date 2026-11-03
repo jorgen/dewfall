@@ -45,6 +45,11 @@ namespace dew::core
 // enqueue work.
 void complete_read_request(read_request_t &r)
 {
+  // The hook runs BEFORE _done is published. Once it is, a thread parked in wait_for_read returns
+  // and may see the hook not yet run, or drop the last reference while it runs.
+  if (r._on_complete)
+    r._on_complete(r);
+
   // Take the continuation under the same lock that publishes _done, so an awaiter racing us either
   // stores its handle before we look (and we resume it) or sees _done and declines to suspend.
   // Neither order can lose the resume.
@@ -56,14 +61,10 @@ void complete_read_request(read_request_t &r)
     continuation = r._continuation;
     resume_loop = r._continuation_loop;
     r._continuation = {};
+    // Under the lock: a waiter that wakes spuriously, sees _done and frees r must not race this.
+    r._block_for_read.notify_all();
   }
-  r._block_for_read.notify_all();
-
-  // Order matters: the hook first, the coroutine resume LAST. Resuming can run arbitrary
-  // continuation code -- including code that drops the last reference to this request -- so touching
-  // r afterwards would be a use-after-free.
-  if (r._on_complete)
-    r._on_complete(r);
+  // Nothing below may touch r: the waiter just released, or the resumed continuation, can free it.
 
   if (continuation)
   {
