@@ -53,57 +53,28 @@ wasm build needs `source ~/dev/emsdk/emsdk_env.sh` first (system python is too o
 
 ## CI dependency cache
 
-`3rdparty/` is cached on GitHub Actions by the composite actions in `.github/actions/cmake-deps/`
-(restore + verify) and `.github/actions/cmake-deps/save` (stamp + roll forward). Used by `ci.yml`
-and by `wheels.yml`'s macOS/Windows legs.
+cmake-dep keeps fetched sources in a shared cache, `~/.cache/cmake-dep` by default, as
+`<CMDEP_DIR>/<name>-<version>-<hash12>/` plus an archive store `<CMDEP_DIR>/archives/sha256/<hex>`.
+On GitHub Actions the composite actions in `.github/actions/cmake-deps/` (restore) and
+`.github/actions/cmake-deps/save` point `CMDEP_DIR` at `$GITHUB_WORKSPACE/3rdparty` and cache only
+the archive store: archives are small, content-addressed and re-hashed by cmake-dep before every
+use (a corrupt one is deleted and refetched), and the extracted trees are rebuilt from them offline.
+Used by `ci.yml` and by `wheels.yml`'s macOS/Windows legs.
 
-The cache **rolls forward** rather than being keyed on the pins: cmake-dep updates `3rdparty/` in
-place, so bumping one pin costs one download. The key is a stable prefix
-`cmdep-<epoch>-<profile>-<os>-<cmake-dep-pin>-`, used as both `key` and `restore-keys` so the exact
-lookup always misses and the prefix search returns the newest entry. The save key is that prefix
-plus a digest of the resulting tree, and the save is skipped when that equals the restored key — so
-an unchanged run uploads nothing.
-
-**Why a verify step exists at all.** cmake-dep's entire "already fetched" test is
-`if (NOT EXISTS "${dir}")`. An empty or truncated directory is skipped forever, and a pin whose
-URL/hash moves without changing the version string is never noticed (`cmakerc`, `argh` and `vio`
-all carry truncated shas as their "version"). That is survivable for a local tree and not
-survivable for one restored into every future run. So each dependency carries a `.cmdep-stamp`
-written after a *successful* configure; on restore each is re-fingerprinted, and anything that
-fails is deleted so the next configure refetches exactly it. `3rdparty/vio-<sha>/3rdparty/` — vio's
-own dependencies, about a third of the bytes — is enumerated from vio's packages file inside the
-fetched tree and verified the same way, but never pruned by name.
-
-**Invalidating it**, in increasing order of bluntness:
-
-| Lever | Effect |
-|---|---|
-| nothing | per-dependency corruption heals itself on the next restore |
-| `CACHE_FORMAT` in `guard.sh` | restored trees are discarded on arrival; the key does not move |
-| `.github/deps-cache-epoch` | changes the key prefix; existing entries are abandoned |
-| the **Purge caches** workflow | `workflow_dispatch`, deletes entries through the API (`gh cache delete`) |
-
-The purge workflow is the only option that reclaims quota immediately, which matters: the limit is
-10 GB per repo and eviction is by last access, so large per-commit entries evict small long-lived
-ones.
-
-`guard.sh` runs standalone if you need to debug it:
+`enumerate.cmake` lists the dependency set without fetching: the packages file's declarations
+(evaluated with the build's `-D` options) plus the transitive packages in `CMake/cmdep.lock`. The
+key is `cmdep2-<epoch>-<profile>-<os>-<cmake-dep-pin>-<digest of that list>`; restore falls back to
+the newest entry under the prefix, so bumping one pin costs one download. The save step prunes
+archives the set no longer names and skips the upload when the exact key was restored.
 
 ```bash
-cmake -DCMDEP_PACKAGES_FILE=$PWD/CMake/3rdPartyPackages.cmake -DCMDEP_ENUM_OUT=/tmp/m.txt \
-      -DCMDEP_PROJECT=dewfall -P .github/actions/cmake-deps/enumerate.cmake
-CMDEP_ALLOW_LOCAL=1 .github/actions/cmake-deps/guard.sh verify --manifest /tmp/m.txt \
-      --dir 3rdparty --enumerate .github/actions/cmake-deps/enumerate.cmake
+cmake -DCMDEP_PACKAGES_FILE=$PWD/CMake/3rdPartyPackages.cmake -DCMDEP_ENUM_OUT=/tmp/m.txt       -DCMDEP_PROJECT=dewfall -P .github/actions/cmake-deps/enumerate.cmake
 ```
 
-`verify` **deletes** unverifiable directories, so it refuses to run outside CI without
-`CMDEP_ALLOW_LOCAL=1`. Pointing it at your working `3rdparty/` forces a refetch of anything it
-cannot vouch for — including everything, if the tree predates stamping.
-
-`CMDEP_DEEP=1` hashes file contents instead of just paths and sizes; it catches a flipped byte at
-unchanged file size, which the default mode cannot. The mode is recorded in each stamp (`v1q`/`v1d`)
-because switching modes invalidates every stamp, and that should read as a mode change rather than
-as mass corruption.
+**Invalidating it:** bump `.github/deps-cache-epoch` (changes the key prefix), or run the **Purge
+caches** workflow (`workflow_dispatch`, deletes entries through the API). The purge workflow is the
+only option that reclaims quota immediately, which matters: the limit is 10 GB per repo and eviction
+is by last access, so large per-commit entries evict small long-lived ones.
 
 ## Running Tests
 
@@ -357,7 +328,8 @@ Components: 1, 2, 3, 4, 4x4.
 
 ## Dependencies
 
-Managed via cmake-dep (CMake/3rdPartyPackages.cmake):
+Managed via cmake-dep (CMake/3rdPartyPackages.cmake; the resolved graph is locked in CMake/cmdep.lock,
+regenerate it with `cmdep lock -DDEW_BUILD_EXAMPLES=ON -DDEW_BUILD_PYTHON=ON` after editing):
 
 | Library | Version | Purpose |
 |---------|---------|---------|
@@ -371,15 +343,16 @@ Managed via cmake-dep (CMake/3rdPartyPackages.cmake):
 | doctest | 2.4.12 | Unit testing |
 | argh | 431bf32 | Argument parsing |
 | unordered_dense | 4.1.2 | Fast hash map/set (ankerl) |
-| vio | 86bbea0 | Async I/O / event loop / object store |
+| vio | 6dde1b6 | Async I/O / event loop / object store (git commit pin) |
 | stbimage | b42009b | Image loading |
 | cmakerc | 952ff | CMake resource compiler |
 | nanobind | 2.13.0 | Python bindings (only when `DEW_BUILD_PYTHON=ON`) |
 | robin_map | 1.4.1 | nanobind's hash map (its release tarballs omit the submodule) |
 
-Pulled in transitively by vio, not listed in `3rdPartyPackages.cmake`: libuv
-(async I/O), LibreSSL (TLS), ada (URL parsing). There is no curl dependency —
-HTTP goes through vio.
+Pulled in transitively by vio (through the lockfile), not listed in `3rdPartyPackages.cmake`:
+BoringSSL (TLS), ada (URL parsing), structify (vio's AWS credential parsing). vio has its own event
+loop; there is no libuv and no curl dependency — HTTP goes through vio. BoringSSL needs NASM on
+Windows x64.
 
 ## Debugging .dew Files with dew extract
 
