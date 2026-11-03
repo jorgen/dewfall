@@ -71,11 +71,13 @@ jobs:
             c_flags: -fsanitize=thread -fno-omit-frame-pointer
             cxx_flags: -fsanitize=thread -fno-omit-frame-pointer
             linker_flags: -fsanitize=thread
+          # -fno-sanitize=vptr: dewfall is -fno-rtti, its third-party code is not, so vio's loop calling
+          # a dewfall about_to_block_t override trips the vptr check on a type with no typeinfo.
           - name: ubsan
             cc: gcc-14
             cxx: g++-14
-            c_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
-            cxx_flags: -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+            c_flags: -fsanitize=undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=all
+            cxx_flags: -fsanitize=undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=all
             linker_flags: -fsanitize=undefined
     name: ${{ matrix.name }}
 
