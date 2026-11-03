@@ -37,6 +37,8 @@ struct synthetic_state_t
   uint32_t produced = 0;
 };
 
+constexpr double k_synthetic_scale = 0.001;
+
 int64_t base_from_name(const char *filename, size_t size)
 {
   // name format: synth_<base>
@@ -47,8 +49,11 @@ int64_t base_from_name(const char *filename, size_t size)
 dew_converter_file_pre_init_info_t synthetic_pre_init(const char *filename, size_t filename_size, struct dew_error_t **)
 {
   dew_converter_file_pre_init_info_t info = {};
+  // World coordinates, like the header min below: raw base times scale. The raw base overclaimed
+  // the bound 1000x, so a watermark taken before synth_100000's first chunk landed finalized the
+  // trees its points route into (the "point insert into finalized tree" assert).
   info.found_aabb_min = 1;
-  info.aabb_min[0] = double(base_from_name(filename, filename_size));
+  info.aabb_min[0] = double(base_from_name(filename, filename_size)) * k_synthetic_scale;
   info.aabb_min[1] = 0.0;
   info.aabb_min[2] = 0.0;
   info.approximate_point_count = 4096;
@@ -65,11 +70,11 @@ void synthetic_init(const char *filename, size_t filename_size, struct dew_conve
   state->total = 4096;
   header->point_count = state->total;
   header->offset[0] = header->offset[1] = header->offset[2] = 0.0;
-  header->scale[0] = header->scale[1] = header->scale[2] = 0.001;
-  header->min[0] = double(state->base) * 0.001;
+  header->scale[0] = header->scale[1] = header->scale[2] = k_synthetic_scale;
+  header->min[0] = double(state->base) * k_synthetic_scale;
   header->min[1] = 0.0;
   header->min[2] = 0.0;
-  header->max[0] = double(state->base + state->total) * 0.001;
+  header->max[0] = double(state->base + state->total) * k_synthetic_scale;
   header->max[1] = 0.001;
   header->max[2] = 0.001;
   dew_attributes_add_attribute(attributes, DEW_ATTRIBUTE_XYZ, uint32_t(strlen(DEW_ATTRIBUTE_XYZ)), dew_type_i32, dew_components_3);
