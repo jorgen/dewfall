@@ -890,7 +890,10 @@ void lod_worker_t::work()
   data.generated_point_count.data = uint32_t(indecies.size());
   data.generated_min = destination_header.morton_min;
   data.generated_max = destination_header.morton_max;
-  scoped_us_t write_timer(lod_generator.stats().lod_write_post_us);
+  // Nothing after cache.write may touch `this`: its completion can finish this tree's level, and the
+  // tree loop then clears tree_workers, destroying this worker while the pool thread is still here.
+  perf_stats_t &stats = lod_generator.stats();
+  scoped_us_t write_timer(stats.lod_write_post_us);
   cache.write(destination_header, lod_attrib_mapping.destination_id, std::move(buffers),
               [this](const storage_header_t &storageheader, attributes_id_t attrib_id, std::vector<storage_location_t> locations, const dew_error_t &error)
               {
@@ -900,8 +903,8 @@ void lod_worker_t::work()
                 this->data.generated_locations = std::move(locations);
                 this->lod_generator.add_worker_done(this->batch, this->tree_index);
               });
-  lod_generator.stats().lod_workers.fetch_add(1, std::memory_order_relaxed);
-  lod_generator.stats().lod_worker_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - worker_start).count()), std::memory_order_relaxed);
+  stats.lod_workers.fetch_add(1, std::memory_order_relaxed);
+  stats.lod_worker_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - worker_start).count()), std::memory_order_relaxed);
 }
 
 static void get_storage_info(tree_registry_t &tree_cache, lod_node_worker_data_t &node)
