@@ -56,14 +56,15 @@ struct unsorted_points_event_t
     : attributes_def(a_attributes_def)
     , public_header(a_public_header)
     , points(std::move(a_points))
-    , reader_file(a_reader_file)
+    , reader_file(&a_reader_file)
   {
   }
 
   std::vector<point_format_t> attributes_def;
   dew_converter_header_t public_header;
   points_t points;
-  point_reader_file_t &reader_file;
+  // A pointer, not a reference: vio's event_pipe_t moves events between its buffers by assignment.
+  point_reader_file_t *reader_file;
 };
 
 class get_data_worker_t

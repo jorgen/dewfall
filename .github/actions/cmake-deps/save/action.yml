@@ -1,84 +1,56 @@
-name: Save cmake-dep third-party sources
+name: Save the cmake-dep archive store
 description: >-
-  Stamp the fetched 3rdparty/ tree and roll the cache forward if it changed. Invoke with
-  `if: always() && <configure step>.outcome == 'success'` so a failing build still leaves a usable
-  cache behind, while a failing configure never blesses a half-fetched tree.
+  Prune the archive store to the enumerated dependency set and save it if it changed. Invoke with
+  `if: always() && <configure step>.outcome == 'success'` so a failing build still leaves the cache
+  behind. Only archives are cached: they are small, content-addressed and re-hashed on every use,
+  and cmake-dep rebuilds the extracted trees from them offline.
 
 inputs:
   dir:
-    description: The third-party directory. Must match the restore step byte for byte.
+    description: CMDEP_DIR relative to the workspace. Must match the restore step.
     default: 3rdparty
   manifest:
     description: The manifest path output by the restore action.
     required: true
-  prefix:
-    description: The key prefix output by the restore action.
+  key:
+    description: The key output by the restore action.
     required: true
   matched-key:
     description: >-
-      The matched-key output from the restore action. Required: actions/cache/save does not
-      self-skip the way the all-in-one action does ("NO-OP in case of SaveOnly action" in its
-      saveImpl.ts), so without this comparison every green run would re-tar the whole tree only to
-      have the reservation rejected.
+      The matched-key output from the restore action. actions/cache/save does not skip on its own, so
+      without this every green run would re-tar the store only to have the reservation rejected.
     required: true
-  removed:
-    description: The removed output from the restore action; see below.
-    default: "0"
-  deep:
-    description: Must match the restore step's value, or every stamp will mismatch on the next run.
-    default: "false"
 
 runs:
   using: composite
   steps:
-    - name: Stamp the fetched dependencies
-      id: stamp
+    - name: Prune the archive store
+      id: prune
       shell: bash
-      env:
-        CMDEP_DEEP: ${{ inputs.deep == 'true' && '1' || '0' }}
       run: |
         set -euo pipefail
-        guard="${GITHUB_ACTION_PATH}/../guard.sh"
-        chmod +x "$guard"
-
-        # Nothing to save if configure never got far enough to fetch. Saving a path that resolves to
-        # zero files is a hard error inside the cache toolkit.
-        if [ -z "$(find "${{ inputs.dir }}" -type f -print -quit 2>/dev/null)" ]; then
-          echo "no fetched dependencies under ${{ inputs.dir }} — nothing to save"
+        store="${{ inputs.dir }}/archives"
+        if [ "${{ inputs.key }}" = "${{ inputs.matched-key }}" ]; then
+          echo "dependency set unchanged since ${{ inputs.key }} — not re-saving"
           echo "skip=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-
-        "$guard" stamp --manifest "${{ inputs.manifest }}" --dir "${{ inputs.dir }}" \
-          --enumerate "${GITHUB_ACTION_PATH}/../enumerate.cmake"
-
-        digest=$("$guard" digest --manifest "${{ inputs.manifest }}" --dir "${{ inputs.dir }}" |
-                   sed -n 's/^digest=//p')
-        key="${{ inputs.prefix }}${digest}"
-
-        # Healing changes nothing about the digest — a refetched dependency reproduces its original
-        # stamp — so a bad entry would keep matching the key it was saved under and never be
-        # replaced. Keys are immutable, so the healed tree goes under a distinct key instead; being
-        # newer, it wins the next prefix lookup and the bad entry ages out.
-        if [ "${{ inputs.removed }}" != "0" ] && [ -n "${{ inputs.matched-key }}" ]; then
-          key="${key}-heal${GITHUB_RUN_ID}"
-          echo "restored entry needed ${{ inputs.removed }} repair(s) — superseding it"
-        fi
-        echo "key=$key" >> "$GITHUB_OUTPUT"
-
-        # The whole point of a rolling cache: a new entry only when the tree actually moved. On an
-        # ordinary run the digest reproduces the restored key exactly and nothing is uploaded.
-        if [ "$key" = "${{ inputs.matched-key }}" ]; then
-          echo "tree unchanged since $key — not re-saving"
+        if [ -z "$(find "$store" -type f -print -quit 2>/dev/null)" ]; then
+          echo "no archives under $store — nothing to save"
           echo "skip=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "tree changed: ${{ inputs.matched-key }} -> $key"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
+        # A prefix hit restores whatever an older pin set left; keep only what this set uses.
+        keep=$(awk -F'|' '$1 != "SYSTEM" { print tolower($5) "/" $6 }' "${{ inputs.manifest }}")
+        find "$store" -type f | while IFS= read -r f; do
+          rel="${f#"$store"/}"
+          printf '%s\n' "$keep" | grep -qxF "$rel" || { echo "prune $rel"; rm -f "$f"; }
+        done
+        echo "skip=false" >> "$GITHUB_OUTPUT"
 
-    - name: Save third-party sources
-      if: steps.stamp.outputs.skip != 'true'
+    - name: Save the archive store
+      if: steps.prune.outputs.skip != 'true'
       uses: actions/cache/save@v4
       with:
-        path: ${{ inputs.dir }}
-        key: ${{ steps.stamp.outputs.key }}
+        path: ${{ inputs.dir }}/archives
+        key: ${{ inputs.key }}

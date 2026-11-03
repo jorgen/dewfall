@@ -1,28 +1,30 @@
-# Enumerate the dependency set a cmake-dep packages file declares, without fetching anything.
+# Enumerate the dependency set a cmake-dep build fetches, without fetching anything.
 #
 #   cmake [-DDEW_BUILD_PYTHON=ON] \
 #         -DCMDEP_PACKAGES_FILE=/abs/path/CMake/3rdPartyPackages.cmake \
+#         [-DCMDEP_LOCK_FILE=/abs/path/CMake/cmdep.lock] \
 #         -DCMDEP_ENUM_OUT=/abs/path/manifest.txt \
-#         [-DCMDEP_PROJECT=dew] \
+#         -DCMDEP_PROJECT=dewfall \
 #         -P enumerate.cmake
 #
-# One record per declared dependency, in declaration order:
+# One record per dependency: the root packages file's declarations in declaration order, then the
+# transitive packages from the lockfile (vio's boringssl, ada, ...), which a configure fetches too.
 #
-#   KIND|name|version|dirname|ALGO|hex|url|payload
+#   KIND|name|version|entry|ALGO|hex|url|payload
 #
-#   KIND    PACKAGE (archive extracted to <dirname>/), FILE (single downloaded file),
-#           or SYSTEM (USE_SYSTEM is on, so nothing lands in 3rdparty/)
-#   dirname the exact top-level entry cmake-dep creates under 3rdparty/
+#   KIND    PACKAGE (archive or git commit, extracted), FILE (single downloaded file),
+#           or SYSTEM (USE_SYSTEM is on, so nothing is fetched)
+#   entry   the cache entry cmake-dep creates: <CMDEP_DIR>/<name>-<version>-<hash12>
 #   payload "" for PACKAGE/SYSTEM, the destination filename for FILE
 #
-# The point of doing this in CMake rather than with a shell regex is that the packages file is
-# evaluated by the real interpreter: `if (DEW_BUILD_PYTHON)` blocks, comments and continuations
-# are handled by definition rather than by imitation. If it ever grows a cmake-dep command this
-# shim does not model, CMake fails loudly here instead of silently under-reporting the set.
+# The archive behind each record is <CMDEP_DIR>/archives/<algo>/<hex>, which is what CI caches.
 #
-# Override resolution mirrors CmDepFetchPackage's (<PREFIX>_<DEP>_VERSION / _URL / _<ALGO> and
-# <PREFIX>_USE_SYSTEM_<DEP>), so a build configured with -D overrides enumerates what that build
-# actually fetches.
+# The packages file is evaluated by the real interpreter, so `if (DEW_BUILD_PYTHON)` blocks are
+# handled by definition. If it grows a cmake-dep command this shim does not model, CMake fails
+# loudly here instead of silently under-reporting the set.
+#
+# Override resolution mirrors cmake-dep's (<PREFIX>_<DEP>_VERSION / _URL / _<ALGO> and
+# <PREFIX>_USE_SYSTEM_<DEP>), so a build configured with -D overrides enumerates what it fetches.
 
 cmake_minimum_required(VERSION 3.20)
 
@@ -33,13 +35,14 @@ get_filename_component(CMDEP_PACKAGES_FILE "${CMDEP_PACKAGES_FILE}" ABSOLUTE)
 if (NOT EXISTS "${CMDEP_PACKAGES_FILE}")
     message(FATAL_ERROR "enumerate: packages file not found: ${CMDEP_PACKAGES_FILE}")
 endif ()
+if (NOT DEFINED CMDEP_LOCK_FILE OR CMDEP_LOCK_FILE STREQUAL "")
+    get_filename_component(_pkg_dir "${CMDEP_PACKAGES_FILE}" DIRECTORY)
+    set(CMDEP_LOCK_FILE "${_pkg_dir}/cmdep.lock")
+endif ()
 
-# cmake-dep derives the knob prefix from CMDEP_PROJECT, falling back to PROJECT_NAME — which does
-# not exist in script mode, so it has to be passed in. Required rather than defaulted: this must be
-# the consuming project's project() name (dewfall -> DEWFALL_<DEP>_VERSION and friends), and a
-# plausible-looking wrong default silently resolves a different set of override knobs than the build
-# does. The failure that produces is nasty and quiet — the manifest names a version the build did not
-# fetch, so the fetched directory is pruned as "stale" on every run and never enters the cache.
+# Required rather than defaulted: the knob prefix must be the consuming project's project() name
+# (dewfall -> DEWFALL_<DEP>_VERSION and friends), or a -D override moves the build without moving
+# the manifest.
 if (NOT DEFINED CMDEP_PROJECT OR CMDEP_PROJECT STREQUAL "")
     message(FATAL_ERROR "enumerate: -DCMDEP_PROJECT=<project() name> is required "
                         "(cmake-dep derives its override-knob prefix from it)")
@@ -48,9 +51,13 @@ string(TOUPPER "${CMDEP_PROJECT}" _prefix)
 string(MAKE_C_IDENTIFIER "${_prefix}" _prefix)
 
 set(_records "")
+set(_names "")
 
 macro(_emit kind name version algo hex url payload)
-    list(APPEND _records "${kind}|${name}|${version}|${name}-${version}|${algo}|${hex}|${url}|${payload}")
+    string(TOLOWER "${hex}" _e_hex)
+    string(SUBSTRING "${_e_hex}" 0 12 _e_short)
+    list(APPEND _records "${kind}|${name}|${version}|${name}-${version}-${_e_short}|${algo}|${_e_hex}|${url}|${payload}")
+    list(APPEND _names "${name}")
 endmacro()
 
 macro(_resolve name raw_version raw_url raw_hash out_ver out_url out_algo out_hex out_sys)
@@ -61,7 +68,7 @@ macro(_resolve name raw_version raw_url raw_hash out_ver out_url out_algo out_he
     if (NOT _m)
         message(FATAL_ERROR "enumerate: hash for '${name}' must be ALGO=HEX, got '${raw_hash}'")
     endif ()
-    set(${out_algo} "${CMAKE_MATCH_1}")
+    string(TOUPPER "${CMAKE_MATCH_1}" ${out_algo})
     set(${out_hex} "${CMAKE_MATCH_2}")
 
     set(${out_ver} "${raw_version}")
@@ -91,12 +98,47 @@ macro(CmDepFetchPackage name version url url_hash)
     endif ()
 endmacro()
 
+# The git archive of a pinned commit, hash-addressed like any other archive. A declaration without
+# SHA256= is cloned directly and never lands in the archive store, so there would be nothing to cache.
+macro(CmDepFetchGit name version repo commit)
+    set(_git_hash "")
+    foreach (_arg ${ARGN})
+        if (_arg MATCHES "^SHA256=")
+            set(_git_hash "${_arg}")
+        endif ()
+    endforeach ()
+    if (_git_hash STREQUAL "")
+        message(FATAL_ERROR "enumerate: CmDepFetchGit(${name}) has no SHA256=; pin one so CI can cache it")
+    endif ()
+    CmDepFetchPackage("${name}" "${version}" "${repo}@${commit}" "${_git_hash}")
+endmacro()
+
 macro(CmDepFetchFile name version url destination_name url_hash)
     _resolve("${name}" "${version}" "${url}" "${url_hash}" _v _u _a _h _s)
     _emit(FILE "${name}" "${_v}" "${_a}" "${_h}" "${_u}" "${destination_name}")
 endmacro()
 
 include("${CMDEP_PACKAGES_FILE}")
+
+# Transitive packages: everything the lock resolved that the root does not declare itself. A
+# configure fetches these up front, before the dependencies that declare them are even added.
+macro(CmDepLockFormat version)
+endmacro()
+macro(CmDepLocked name)
+    cmake_parse_arguments(_L "" "VERSION;URL;GIT;COMMIT;HASH;DECLARED_BY;DECLARED_IN" "PATCHES;REQUESTED_BY" ${ARGN})
+    if (NOT _L_DECLARED_BY STREQUAL ".")
+        list(FIND _names "${name}" _seen)
+        if (_seen EQUAL -1)
+            if (_L_GIT)
+                set(_L_URL "${_L_GIT}@${_L_COMMIT}")
+            endif ()
+            CmDepFetchPackage("${name}" "${_L_VERSION}" "${_L_URL}" "${_L_HASH}")
+        endif ()
+    endif ()
+endmacro()
+if (EXISTS "${CMDEP_LOCK_FILE}")
+    include("${CMDEP_LOCK_FILE}")
+endif ()
 
 list(LENGTH _records _count)
 if (_count EQUAL 0)

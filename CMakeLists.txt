@@ -11,7 +11,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
 include(FetchContent)
 FetchContent_Declare(cmake-dep
     GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
-    GIT_TAG 71abe2b188d28f433bf6436bcf5e5b0edc49b6ce
+    GIT_TAG 756bee3072d1bf67e179b62a9635cdcdef5931e7
 )
 FetchContent_MakeAvailable(cmake-dep)
 list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")

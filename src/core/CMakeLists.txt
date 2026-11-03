@@ -78,7 +78,7 @@ target_include_directories(dew_core_objects
         ${zstd_SOURCE_DIR}/lib/common
 )
 add_library(dew_core empty_dylib_function.cpp $<TARGET_OBJECTS:dew_core_objects>)
-CmDepTargetLinkLibrary(dew_core PUBLIC dew_core_objects)
+target_link_libraries(dew_core PUBLIC dew_core_objects)
 if (BUILD_SHARED_LIBS)
     target_compile_definitions(dew_core_objects PRIVATE DEW_CORE_EXPORTS)
 endif ()

@@ -67,7 +67,7 @@ set(_renderer_example_deps dew_render dew_converter fmt glm renderer_example::sh
 if(TARGET SDL3::SDL3main)
     list(APPEND _renderer_example_deps SDL3::SDL3main)
 endif()
-CmDepTargetLinkLibrary(renderer_example PRIVATE ${_renderer_example_deps})
+target_link_libraries(renderer_example PRIVATE ${_renderer_example_deps})
 copy_dll_for_target(renderer_example dew_render dew_converter dew_core SDL3::SDL3)
 setWarningFlagsForTarget(renderer_example)
 if(NOT MSVC)

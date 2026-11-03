@@ -280,10 +280,10 @@ void point_reader_t::handle_unsorted_points(unsorted_points_event_t &&unsorted_p
   // Same reason: the sort worker below goes onto the shared pool.
   if (_shutting_down.load(std::memory_order_acquire))
     return;
-  auto &tree_config = unsorted_points.reader_file.tree_config;
-  auto &reader_file = unsorted_points.reader_file;
-  unsorted_points.reader_file.sort_workers.emplace_back(new sort_worker_t(tree_config, reader_file, _attributes_configs, _perf_stats, unsorted_points.public_header, std::move(unsorted_points.points)));
-  unsorted_points.reader_file.sort_workers.back()->enqueue(unsorted_points.reader_file.event_loop, unsorted_points.reader_file.thread_pool);
+  auto &reader_file = *unsorted_points.reader_file;
+  auto &tree_config = reader_file.tree_config;
+  reader_file.sort_workers.emplace_back(new sort_worker_t(tree_config, reader_file, _attributes_configs, _perf_stats, unsorted_points.public_header, std::move(unsorted_points.points)));
+  reader_file.sort_workers.back()->enqueue(reader_file.event_loop, reader_file.thread_pool);
 }
 
 } // namespace dew::converter

@@ -1,22 +1,11 @@
-# Cache epoch for the cmake-dep 3rdparty/ tree (.github/actions/cmake-deps).
+# Cache epoch for the cmake-dep archive store (.github/actions/cmake-deps).
 #
-# The dependency cache rolls forward on its own: cmake-dep updates 3rdparty/ in place, so bumping a
-# pin costs one download and the next run saves the updated tree under a new key with the same
-# prefix. Nothing here needs touching for ordinary pin changes.
+# The cache rolls forward on its own: the key is the enumerated dependency set, restore falls back
+# to the newest entry under the prefix, and cmake-dep only downloads what is missing. Every stored
+# archive is re-hashed before use and a corrupt one is refetched, so nothing here needs touching for
+# ordinary pin changes or a bad entry.
 #
-# There are three levers for throwing a cache away, in increasing order of bluntness:
-#
-#   1. Nothing.  The restore step verifies every dependency against its stamp and deletes whatever
-#      fails, so ordinary corruption heals one dependency at a time, automatically.
-#
-#   2. CACHE_FORMAT in .github/actions/cmake-deps/guard.sh.  Bumping it makes every restored tree be
-#      discarded on arrival and refetched, without changing the key. Use this when the stamp format
-#      or the verification rules change, so old trees can no longer be reasoned about.
-#
-#   3. This file.  Bumping it changes the key prefix, abandoning every existing entry outright (they
-#      age out after 7 days unused). Use it when you want the old entries gone rather than rewritten
-#      — e.g. an upstream URL served different bytes under an unchanged hash.
-#
-# For a one-off purge with no commit at all, run the "Purge caches" workflow
+# Bumping this file changes the key prefix, abandoning every existing entry outright (they age out
+# after 7 days unused). For a one-off purge with no commit at all, run the "Purge caches" workflow
 # (.github/workflows/cache-purge.yml), which deletes entries through the API.
 1

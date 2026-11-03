@@ -100,8 +100,8 @@ jobs:
         run: |
           # The ccache key is per-commit, so every run mints a fresh entry; at ~700 MB x 3 legs that
           # is ~2 GB per push against a 10 GB repository quota, and eviction is by last access. Left
-          # unbounded, the sanitizer caches evict everything else in the repo — including the 40 MB
-          # dependency cache restored just above. --max-size writes the cap into the cache dir's own
+          # unbounded, the sanitizer caches evict everything else in the repo — including the dependency
+          # archive store restored just above. --max-size writes the cap into the cache dir's own
           # config, so it applies to the Build step too; an env var on this step alone would not.
           ccache --max-size=350M
           ccache --zero-stats
@@ -135,12 +135,11 @@ jobs:
       # restore and save halves are separate actions.
       #
       # Only one leg saves. All three compute the same key (they share a container, so runner.os
-      # does not separate them), and the losers of that race just waste time taring the tree.
+      # does not separate them), and the losers of that race just waste time taring the store.
       - name: Save 3rdparty dependencies
         if: always() && matrix.name == 'asan' && steps.configure.outcome == 'success'
         uses: ./.github/actions/cmake-deps/save
         with:
           manifest: ${{ steps.deps.outputs.manifest }}
-          prefix: ${{ steps.deps.outputs.prefix }}
+          key: ${{ steps.deps.outputs.key }}
           matched-key: ${{ steps.deps.outputs.matched-key }}
-          removed: ${{ steps.deps.outputs.removed }}

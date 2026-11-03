@@ -21,9 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#ifndef __EMSCRIPTEN__
-#include <uv.h> // unused here; pulls libuv, which the wasm build does not link
-#endif
 #include <vector>
 
 #include <dew/converter/converter.h>

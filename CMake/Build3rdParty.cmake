@@ -1,10 +1,6 @@
 macro(Build3rdParty)
-    #list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/CMake/FindPackage/SDL2)
-    #GetPackageInstallDir(SDL2_INSTALL_DIR sdl_build ${sdl_VERSION})
-    #Find_Package(SDL2 REQUIRED)
-    #BuildExternalCMake(sdl_build ${sdl_VERSION} ${sdl_SOURCE_DIR} "" "SDL2::SDL2;SDL2::SDL2main")
     # Save and strip -fno-exceptions/-fno-rtti for third-party subdirectories
-    # that need exceptions (vio tests, fmt, laszip, etc). Restore after.
+    # that need exceptions (fmt, laszip, etc). Restore after.
     set(_SAVED_CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
     string(REPLACE "-fno-exceptions" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     string(REPLACE "-fno-rtti" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
@@ -14,24 +10,17 @@ macro(Build3rdParty)
     string(REPLACE "-D_HAS_EXCEPTIONS=0" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 
     if (DEW_BUILD_EXAMPLES)
-        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-        add_subdirectory(${sdl_SOURCE_DIR} SYSTEM)
-        unset(SDL_TEST_LIBRARY CACHE)
+        CmDepAddPackage(sdl OPTIONS SDL_TEST_LIBRARY=OFF)
     endif ()
 
-    set(VIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(VIO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    # vio builds libuv as static (LIBUV_BUILD_SHARED OFF) but libuv's alias
-    # target selects uv vs uv_a based on BUILD_SHARED_LIBS. Override it so
-    # the alias points to the static target that actually gets built.
+    # Everything below is linked statically into the dew libraries. BUILD_SHARED_LIBS is shadowed with
+    # a normal variable rather than forced through OPTIONS, which would unset the user's cache entry.
+    # vio has its own VIO_BUILD_SHARED, but BoringSSL (vio's dependency) follows BUILD_SHARED_LIBS.
     set(_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
     set(BUILD_SHARED_LIBS OFF)
-    add_subdirectory(${vio_SOURCE_DIR} SYSTEM)
-    set(BUILD_SHARED_LIBS ${_SAVED_BUILD_SHARED_LIBS})
-    unset(VIO_BUILD_TESTS CACHE)
-    unset(VIO_BUILD_EXAMPLES CACHE)
-    # vio changed its include directory from PUBLIC to PRIVATE; re-expose it
-    target_include_directories(vio PUBLIC ${vio_SOURCE_DIR}/src)
+    # vio keeps its include directory PRIVATE; PUBLIC_INCLUDE re-exposes it.
+    CmDepAddPackage(vio CONFIG PUBLIC_INCLUDE src
+        OPTIONS VIO_BUILD_TESTS=OFF VIO_BUILD_EXAMPLES=OFF VIO_BUILD_GUI=OFF VIO_BUILD_SHARED=OFF VIO_INSTALL=OFF)
 
     # laszip is only needed for LAS/LAZ ingest (the write/convert path), which the WebAssembly read-only
     # data library does not build. Skip it under Emscripten.
@@ -88,18 +77,16 @@ macro(Build3rdParty)
     endif ()
     endif () # NOT EMSCRIPTEN (laszip)
 
-    set(OLD_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
-    set(BUILD_SHARED_LIBS OFF)
-    add_subdirectory(${fmt_SOURCE_DIR} SYSTEM)
+    CmDepAddPackage(fmt)
     # Clang on MinGW doesn't properly auto-detect -fno-exceptions for fmt headers
     if (NOT MSVC)
         target_compile_definitions(fmt PUBLIC FMT_EXCEPTIONS=0)
     endif ()
-    add_subdirectory(${glm_SOURCE_DIR} SYSTEM)
-    set(DOCTEST_WITH_TESTS OFF CACHE BOOL "" FORCE)
-    add_subdirectory(${doctest_SOURCE_DIR} SYSTEM)
-    unset(DOCTEST_WITH_TESTS CACHE)
-    add_subdirectory(${unordered_dense_SOURCE_DIR} SYSTEM)
+    CmDepAddPackage(glm)
+    CmDepAddPackage(doctest OPTIONS DOCTEST_WITH_TESTS=OFF)
+    CmDepAddPackage(unordered_dense)
+    # zstd's CMake project lives in build/cmake, not at the root, so it cannot go through
+    # CmDepAddPackage.
     set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
@@ -108,7 +95,7 @@ macro(Build3rdParty)
         # No pthreads in the single-threaded wasm build.
         set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
     endif ()
-    add_subdirectory(${zstd_SOURCE_DIR}/build/cmake ${CMAKE_CURRENT_BINARY_DIR}/zstd_build SYSTEM)
+    add_subdirectory(${zstd_SOURCE_DIR}/build/cmake ${CMAKE_CURRENT_BINARY_DIR}/zstd_build SYSTEM EXCLUDE_FROM_ALL)
     unset(ZSTD_BUILD_PROGRAMS CACHE)
     unset(ZSTD_BUILD_SHARED CACHE)
     unset(ZSTD_BUILD_STATIC CACHE)
@@ -119,28 +106,15 @@ macro(Build3rdParty)
     # drop-in consumers; off, because a global target called `zlib` is exactly the kind of name that
     # collides later. BUILD_TESTING defaults ON here and pulls gtest, so it must be forced off.
     if (DEW_BUILD_EXAMPLES)
-        set(ZLIB_COMPAT OFF CACHE BOOL "" FORCE)
-        set(ZLIB_ALIASES OFF CACHE BOOL "" FORCE)
-        set(WITH_GZFILEOP OFF CACHE BOOL "" FORCE)   # we inflate memory buffers; no gzFile needed
-        set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-        set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
-        set(WITH_GTEST OFF CACHE BOOL "" FORCE)
-        set(WITH_BENCHMARKS OFF CACHE BOOL "" FORCE)
-        set(WITH_BENCHMARK_APPS OFF CACHE BOOL "" FORCE)
-        set(INSTALL_UTILS OFF CACHE BOOL "" FORCE)
-        add_subdirectory(${zlib_ng_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/zlib_ng_build SYSTEM)
-        unset(ZLIB_COMPAT CACHE)
-        unset(ZLIB_ALIASES CACHE)
-        unset(WITH_GZFILEOP CACHE)
-        unset(BUILD_TESTING CACHE)
-        unset(ZLIB_ENABLE_TESTS CACHE)
-        unset(WITH_GTEST CACHE)
-        unset(WITH_BENCHMARKS CACHE)
-        unset(WITH_BENCHMARK_APPS CACHE)
-        unset(INSTALL_UTILS CACHE)
+        CmDepAddPackage(zlib_ng OPTIONS
+            ZLIB_COMPAT=OFF ZLIB_ALIASES=OFF
+            WITH_GZFILEOP=OFF   # we inflate memory buffers; no gzFile needed
+            BUILD_TESTING=OFF ZLIB_ENABLE_TESTS=OFF WITH_GTEST=OFF
+            WITH_BENCHMARKS=OFF WITH_BENCHMARK_APPS=OFF INSTALL_UTILS=OFF)
     endif ()
 
-    set(BUILD_SHARED_LIBS ${OLD_BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS ${_SAVED_BUILD_SHARED_LIBS})
+    # CMakeRC is a CMake module, not a project: include() it rather than add it.
     include(${cmakerc_SOURCE_DIR}/CMakeRC.cmake)
 
     # Restore original flags for points' own code

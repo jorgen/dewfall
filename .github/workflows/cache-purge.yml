@@ -1,14 +1,14 @@
 name: Purge caches
 
 # Manual escape hatch for the Actions cache. Actions cache entries are immutable — you cannot
-# overwrite a key, only abandon it — so when an entry has gone bad there are exactly two moves:
-# change the key (bump .github/deps-cache-epoch, which needs a commit) or delete the entry, which
-# is what this does.
+# overwrite a key, only abandon it — so to get rid of an entry there are exactly two moves: change
+# the key (bump .github/deps-cache-epoch, which needs a commit) or delete the entry, which is what
+# this does.
 #
 # Also useful for the quota. The limit is 10 GB per repository and eviction is by last-access,
 # oldest first, so a workflow that mints large entries on every commit will silently evict small
-# long-lived ones. The per-commit ccache entries in ci.yml are ~700 MB each; the dependency cache
-# they compete with is ~40 MB.
+# long-lived ones. The per-commit ccache entries in ci.yml are ~700 MB each; the dependency archive
+# store they compete with (keys cmdep2-*) is far smaller.
 
 on:
   workflow_dispatch:

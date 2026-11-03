@@ -22,7 +22,7 @@
 #include "bucket_format.hpp"
 #include "file_hole_punch.hpp"
 
-#include <uv.h>
+#include <vio/errc.h>
 
 #include <cassert>
 #include <cstring>
@@ -33,7 +33,7 @@ namespace dew::core
 
 // Read one blob into a fresh buffer, off the loop.
 //
-// The blocking uv_fs_read this replaces was fine when the only caller was the converter opening from
+// The blocking synchronous read this replaces was fine when the only caller was the converter opening from
 // its own thread, but these blobs are not small -- a tree registry runs to megabytes -- and the query
 // engine reads them from a loop that must stay responsive. co_await hands the wait back to the loop
 // instead of owning the thread for the duration.
@@ -230,8 +230,7 @@ dew_error_t packed_file_backend_t::open_for_write(bool truncate)
 
   if (truncate)
   {
-    uv_fs_t request = {};
-    uv_fs_ftruncate(_event_loop.loop(), &request, (**_file).handle, 0, NULL);
+    (void)vio::truncate_file(**_file, 0);
 
     // When the file already existed the constructor skipped reserving the index/superblock region
     // at offset 0 (it only reserves that for a brand-new file). Truncation discards the existing
@@ -458,7 +457,7 @@ vio::task_t<dew_error_t> packed_file_backend_t::write_allocated(storage_location
   dew_error_t error;
   if (!result.has_value())
   {
-    if (_residency && _spill && result.error().code == UV_ENOSPC)
+    if (_residency && _spill && result.error().code == vio::errc::no_space)
     {
       // Disk full below the cap (shared disk): divert reactively instead of poisoning the
       // conversion. The alloc charge is reversed -- the bytes never landed locally.
@@ -784,8 +783,7 @@ vio::task_t<dew_error_t> packed_file_backend_t::write_index(checkpoint_t checkpo
   _tree_registry_location = checkpoint.tree_registry;
   _residency_location = residency_location;
 
-  uv_fs_t req = {};
-  uv_fs_fsync(_event_loop.loop(), &req, file.handle, NULL);
+  (void)vio::fsync_file_sync(file);
 
   if (_residency)
   {

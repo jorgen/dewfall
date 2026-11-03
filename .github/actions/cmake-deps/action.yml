@@ -1,7 +1,9 @@
-name: Restore cmake-dep third-party sources
+name: Restore the cmake-dep archive store
 description: >-
-  Restore the cmake-dep 3rdparty/ tree from the Actions cache and verify it, deleting anything that
-  cannot be vouched for so the next configure refetches exactly that. Pair with cmake-deps/save.
+  Point cmake-dep at a cache directory inside the workspace (CMDEP_DIR) and restore its archive store
+  from the Actions cache. cmake-dep re-hashes every stored archive before using it and refetches
+  anything missing or corrupt, so a stale or partial restore costs downloads, never correctness.
+  Pair with cmake-deps/save.
 
 inputs:
   packages-file:
@@ -11,20 +13,16 @@ inputs:
     description: >-
       The consuming project's project() name. cmake-dep builds its per-dependency override knobs from
       it (dewfall -> DEWFALL_<DEP>_VERSION / _URL / _SHA256, DEWFALL_USE_SYSTEM_<DEP>), so enumeration
-      must use the same one the build does or a -D override moves the tree without moving the
-      manifest — and the fetched directory is then pruned as stale on every run.
+      must use the same one the build does, or a -D override changes what is fetched without changing
+      the key.
     default: dewfall
   dir:
     description: >-
-      The third-party directory, relative to the workspace. Must match the save step byte for byte —
-      the cache "version" hashes the path list, so a mismatch silently prevents cache sharing.
+      CMDEP_DIR, relative to the workspace. Exported to the job as an absolute path, so the configure
+      and every nested project resolve the same directory. Must match the save step.
     default: 3rdparty
   profile:
-    description: >-
-      Discriminator for builds whose dependency set is not captured by the packages file alone.
-      An Emscripten build skips vio's nested fetch entirely, so its tree is a strict subset of a
-      native one; sharing a key between them would let the subset win the save and quietly starve
-      every native job. Use native / wasm / python.
+    description: Discriminator for builds with a different dependency set (native / wasm / python).
     default: native
   cmake-args:
     description: Extra -D flags for enumeration, e.g. -DDEW_BUILD_PYTHON=ON. Must match the build's.
@@ -32,38 +30,24 @@ inputs:
   epoch-file:
     description: >-
       File whose contents are folded into the cache key prefix. Bumping it in a commit abandons every
-      existing entry, which is one of the two ways to force a cold refetch (the other is bumping
-      CACHE_FORMAT in guard.sh, which discards restored trees without moving the key).
+      existing entry.
     default: .github/deps-cache-epoch
   bootstrap-file:
     description: >-
-      File to scrape the cmake-dep revision from (the FetchContent GIT_TAG). Only that one line is
-      folded into the key, not the whole file — cmake-dep decides the on-disk layout, but unrelated
-      edits to the root CMakeLists.txt must not throw the cache away.
+      File to scrape the cmake-dep revision from (the FetchContent GIT_TAG). Only that line is folded
+      into the key: cmake-dep decides the on-disk layout, unrelated edits must not cost the cache.
     default: CMakeLists.txt
-  deep:
-    description: Hash file contents as well as paths and sizes when fingerprinting. Slower, stricter.
-    default: "false"
 
 outputs:
-  prefix:
-    description: The stable key prefix; the save step appends the resulting tree's digest to it.
-    value: ${{ steps.key.outputs.prefix }}
+  key:
+    description: The exact key for this dependency set; the save step writes under it.
+    value: ${{ steps.key.outputs.key }}
   matched-key:
-    description: >-
-      The key actually restored, or empty on a cold cache. The save step compares it against the key
-      it would write and skips the upload when they are equal — which is what keeps a rolling cache
-      from minting a fresh entry on every run.
+    description: The key actually restored, or empty on a cold cache. The save step skips when equal.
     value: ${{ steps.restore.outputs.cache-matched-key }}
   manifest:
     description: Path to the enumerated dependency manifest, to be passed to the save step.
     value: ${{ steps.key.outputs.manifest }}
-  removed:
-    description: >-
-      How many dependencies verification had to delete. Non-zero means the restored entry was bad;
-      the save step uses it to write the healed tree under a distinct key, because a cache entry
-      cannot be overwritten and would otherwise be restored and re-healed on every future run.
-    value: ${{ steps.verify.outputs.removed }}
 
 runs:
   using: composite
@@ -79,60 +63,39 @@ runs:
         mkdir -p "$out"
         manifest="$out/manifest.txt"
 
+        # The packages file plus the lockfile next to it, so vio's own dependencies are in the set.
         cmake ${{ inputs.cmake-args }} \
           -DCMDEP_PACKAGES_FILE="${GITHUB_WORKSPACE}/${{ inputs.packages-file }}" \
           -DCMDEP_ENUM_OUT="$manifest" \
           -DCMDEP_PROJECT="${{ inputs.project }}" \
           -P "${GITHUB_ACTION_PATH}/enumerate.cmake"
-
-        # An empty manifest would produce a stable, plausible-looking key pinned to nothing —
-        # exactly the silent-corruption path that hashFiles() opens by returning "" on no match.
         test -s "$manifest" || { echo "::error::enumerated an empty dependency set"; exit 1; }
 
-        # `|| true` matters: an epoch file that is entirely comments makes grep exit 1, and under
-        # `set -e` that kills the step before the fallback below can run.
+        # `|| true`: an epoch file that is all comments makes grep exit 1 under `set -e`.
         epoch=0
         if [ -f "${{ inputs.epoch-file }}" ]; then
           epoch=$(grep -v '^[[:space:]]*#' "${{ inputs.epoch-file }}" | tr -d '[:space:]' || true)
           [ -n "$epoch" ] || epoch=0
         fi
+        pin=$(awk '/cmake-dep/ { seen = 1 } seen && /GIT_TAG/ { print $2; exit }' "${{ inputs.bootstrap-file }}" | cut -c1-12)
+        [ -n "$pin" ] || pin=none
+        if command -v sha256sum >/dev/null 2>&1; then sha="sha256sum"; else sha="shasum -a 256"; fi
+        digest=$($sha < "$manifest" | cut -c1-16)
 
-        chmod +x "${GITHUB_ACTION_PATH}/guard.sh"
-        "${GITHUB_ACTION_PATH}/guard.sh" key \
-          --manifest "$manifest" \
-          --epoch "$epoch" \
-          --profile "${{ inputs.profile }}" \
-          --os "${{ runner.os }}" \
-          --bootstrap "${{ inputs.bootstrap-file }}" >> "$GITHUB_OUTPUT"
-
+        # Restore takes the newest entry under the prefix, so one bumped pin costs one download.
+        prefix="cmdep2-${epoch}-${{ inputs.profile }}-${{ runner.os }}-${pin}-"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "key=${prefix}${digest}" >> "$GITHUB_OUTPUT"
         echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+        # $GITHUB_WORKSPACE, not ${{ github.workspace }}: inside a container job only the former is
+        # the path the container sees.
+        echo "CMDEP_DIR=${GITHUB_WORKSPACE}/${{ inputs.dir }}" >> "$GITHUB_ENV"
         echo "Dependency set: $(wc -l < "$manifest" | tr -d ' ') packages, epoch $epoch"
 
-    - name: Restore third-party sources
+    - name: Restore the archive store
       id: restore
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.dir }}
-        # Both the same prefix on purpose. Nothing is ever saved under the bare prefix, so the exact
-        # lookup always misses and the prefix search returns the most recently written entry — the
-        # freshest tree for this epoch/profile/os. That is what lets one bumped pin cost one
-        # download instead of thirteen: everything else is already on disk, and cmake-dep only
-        # fetches what is missing.
-        key: ${{ steps.key.outputs.prefix }}
+        path: ${{ inputs.dir }}/archives
+        key: ${{ steps.key.outputs.key }}
         restore-keys: ${{ steps.key.outputs.prefix }}
-
-    - name: Verify and prune the restored tree
-      id: verify
-      shell: bash
-      env:
-        CMDEP_DEEP: ${{ inputs.deep == 'true' && '1' || '0' }}
-        CI: "true"
-      run: |
-        set -euo pipefail
-        chmod +x "${GITHUB_ACTION_PATH}/guard.sh"
-        "${GITHUB_ACTION_PATH}/guard.sh" verify \
-          --manifest "${{ steps.key.outputs.manifest }}" \
-          --dir "${{ inputs.dir }}" \
-          --enumerate "${GITHUB_ACTION_PATH}/enumerate.cmake" | tee "${RUNNER_TEMP}/cmake-deps/verify.log"
-        sed -n 's/^removed=//p' "${RUNNER_TEMP}/cmake-deps/verify.log" | tail -1 |
-          { read -r n || n=0; echo "removed=${n:-0}" >> "$GITHUB_OUTPUT"; }
