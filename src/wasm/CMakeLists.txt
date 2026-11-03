@@ -125,6 +125,7 @@ add_executable(dew_render_wasm
     ${_render}/image_decoder.cpp
     # converter read/stream path (the write/laszip/packed-file TUs are excluded)
     ${_conv}/processor.cpp
+    ${_conv}/attribute_amend.cpp # processor_t owns an attribute_amend_t
     ${_conv}/storage_handler.cpp
     ${_core}/blob_reader.cpp
     ${_conv}/tree_handler.cpp
