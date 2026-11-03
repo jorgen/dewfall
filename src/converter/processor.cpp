@@ -645,14 +645,22 @@ vio::task_t<void> processor_t::do_handle_new_files(std::vector<std::pair<input_d
   // never turns true and wait_idle() blocks for good. schedule_work may answer with an unexpected,
   // which carries no input id, so sweep for whatever the results did not account for rather than
   // assuming they line up with the requests.
+  bool retired_any = false;
   for (const auto &file_ref : file_refs)
   {
     bool found = false;
     for (const auto &id : settled)
       found = found || id == file_ref.first;
     if (!found)
+    {
       _input_data_source_registry.handle_file_failed(file_ref.first);
+      retired_any = true;
+    }
   }
+  // Retiring an input can lift the done-morton (to terminal, if it was the last one) and nothing
+  // else would re-evaluate it. A batch where something settled gets that from its read/insert events.
+  if (retired_any && settled.empty())
+    maybe_start_lod();
 }
 
 void processor_t::handle_input_init_done(std::tuple<input_data_id_t, attributes_id_t, dew_converter_header_t> &&event)
@@ -688,6 +696,10 @@ void processor_t::handle_file_reading_done(input_data_id_t &&file)
     fmt::print(stderr, "[sched] reading_done file={}\n", file.data);
   _read_sort_active_approximate_size -= _input_data_source_registry.get_approximate_size(file);
   _input_data_source_registry.handle_reading_done(file);
+  // A file is done once it is both read AND inserted, and the two events race. If the read lands
+  // last, this is the only place the pass it unlocks (the terminal one, for the last file) can
+  // start: otherwise the processor goes idle with the dataset un-LOD'd and the bucket incomplete.
+  maybe_start_lod();
 }
 
 void processor_t::handle_index_write_done()
