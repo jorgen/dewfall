@@ -62,23 +62,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && pip3 install --break-system-packages cmake \
  && rm -rf /var/lib/apt/lists/*
 
-# Pinned dependency commits — keep in sync with .github/workflows/deploy.yml.
-ARG VIO_REF=2051451f4067e580a09d036323834b69ce44661c
-ARG STRUCTIFY_REF=7ff77ebeb8da5c28d24d88a55abde350e0f0e0e4
-ARG PRISM_REF=20dbed48e9bf6f63690c2f24f58182f4525ba853
-RUN git clone --filter=blob:none https://github.com/jorgen/vio.git       /deps/vio       && git -C /deps/vio       checkout -q "$VIO_REF" \
- && git clone --filter=blob:none https://github.com/jorgen/structify.git /deps/structify && git -C /deps/structify checkout -q "$STRUCTIFY_REF" \
- && git clone --filter=blob:none https://github.com/jorgen/prism.git     /deps/prism     && git -C /deps/prism     checkout -q "$PRISM_REF"
-
 COPY backend/ /src/backend/
-RUN cmake -S /src/backend -B /build -G Ninja \
+# Dependencies (vio, structify, prism) are pinned in backend/cmdep-packages.cmake and fetched by
+# cmake-dep; CMDEP_LOCKED fails the build if backend/cmdep.lock is out of date.
+RUN --mount=type=cache,target=/root/.cache/cmake-dep \
+    cmake -S /src/backend -B /build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMDEP_LOCKED=ON \
       -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
-      -DDEW_WEB_VIO_DIR=/deps/vio \
-      -DDEW_WEB_STRUCTIFY_DIR=/deps/structify \
-      -DDEW_WEB_PRISM_DIR=/deps/prism \
  && cmake --build /build --target dew_server \
- && ldd /build/dew_server || true
+ && (ldd /build/dew_server || true)
 
 # ---------- runtime ----------
 FROM ubuntu:24.04
