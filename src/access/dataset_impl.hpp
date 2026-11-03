@@ -104,6 +104,8 @@ struct dataset_impl_t
   std::atomic<dew_dataset_state_t> state{dew_dataset_opening};
   std::mutex state_mutex;
   std::condition_variable state_cond;
+  // What dew_dataset_wait_ready waits on: `state`, but set only after set_state fired the pump for it.
+  dew_dataset_state_t announced_state = dew_dataset_opening;
   void set_state(dew_dataset_state_t next);
   std::mutex mutex;
   // shared_ptr so an in-flight request survives dew_request_release: the caller is done with the

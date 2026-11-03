@@ -86,14 +86,15 @@ enum dew_dataset_state_t dew_dataset_wait_ready(struct dew_dataset_t *dataset, i
 {
   if (!dataset)
     return dew_dataset_error;
-  auto settled = [dataset] { return dataset->state.load(std::memory_order_acquire) != dew_dataset_opening; };
+  // announced_state, not state: it only moves once set_state has fired the pump (see set_state).
+  auto settled = [dataset] { return dataset->announced_state != dew_dataset_opening; };
   std::unique_lock<std::mutex> lock(dataset->state_mutex);
   if (timeout_ms < 0)
     dataset->state_cond.wait(lock, settled);
   else
     dataset->state_cond.wait_for(lock, std::chrono::milliseconds(timeout_ms), settled);
   // Still `opening` means the wait timed out, which is distinct from having failed to open.
-  return dataset->state.load(std::memory_order_acquire);
+  return dataset->announced_state;
 }
 
 uint8_t dew_access_can_block(void)

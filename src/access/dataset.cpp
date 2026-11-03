@@ -78,9 +78,15 @@ void dataset_impl_t::set_state(dew_dataset_state_t next)
     std::unique_lock<std::mutex> lock(state_mutex);
     state.store(next, std::memory_order_release);
   }
-  state_cond.notify_all();
   // A state change is something the host may be waiting to hear about, so it wakes the pump too.
+  // Fired BEFORE dew_dataset_wait_ready is released: a host that waits for ready and then polls must
+  // find this wake already delivered, not have it land later and be mistaken for the next event.
   pump_fire(pump);
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    announced_state = next;
+  }
+  state_cond.notify_all();
 }
 
 vio::task_t<void> dataset_impl_t::co_open()
