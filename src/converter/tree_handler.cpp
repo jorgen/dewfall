@@ -296,7 +296,7 @@ void tree_handler_t::request_all_trees()
     {
       if (_tree_registry.locations[i].size == 0)
         continue;
-      if (i < _tree_registry.tree_id_initialized.size() && std::atomic_ref<const uint8_t>(_tree_registry.tree_id_initialized[i]).load(std::memory_order_acquire))
+      if (i < _tree_registry.tree_id_initialized.size() && std::atomic_ref<uint8_t>(const_cast<uint8_t &>(_tree_registry.tree_id_initialized[i])).load(std::memory_order_acquire))
         n++;
     }
     return n >= wanted;

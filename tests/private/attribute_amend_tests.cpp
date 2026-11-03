@@ -1872,9 +1872,11 @@ TEST_CASE("amend: an amended attribute survives a later LOD pass")
     }
     MESSAGE(stage, ": ", result.point_count, " coarse points, reflectance ", value_buffer ? "present" : "ABSENT", ", ", correct, " correct, ", zero, " zero (never amended), ", wrong, " WRONG");
     const uint64_t points = result.point_count;
+    // Read before the release: the buffers live in the request.
+    const bool have_values = value_buffer != nullptr && value_buffer->size_bytes != 0;
     dew_request_release(request);
     dew_dataset_close(dataset);
-    return std::make_tuple(points, correct, wrong, value_buffer != nullptr && value_buffer->size_bytes != 0);
+    return std::make_tuple(points, correct, wrong, have_values);
   };
 
   auto before = coarse_reflectance("after the amend");

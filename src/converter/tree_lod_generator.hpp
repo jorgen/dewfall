@@ -146,9 +146,14 @@ public:
   // Called from the STORAGE loop (the write completion callback). Only ever touches this tree's own
   // counter, and only the completion that finishes a tree's level wakes the tree loop -- so the wake
   // rate is unchanged from the old per-batch-level scheme, just attributed per tree.
+  //
+  // tree_in_flight is read BEFORE the increment. Once the increment lands, the tree loop may see the
+  // level complete and rewrite tree_in_flight for the next level, so reading it afterwards raced
+  // advance_tree (TSan). Before the increment the level cannot look complete, so nothing writes it.
   void add_worker_done(lod_worker_batch_t &batch, uint32_t tree_index)
   {
-    if (++batch.tree_completed[tree_index] == batch.tree_in_flight[tree_index])
+    const int in_flight = batch.tree_in_flight[tree_index];
+    if (++batch.tree_completed[tree_index] == in_flight)
     {
       _iterate_workers.post_event();
     }
